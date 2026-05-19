@@ -1,0 +1,29 @@
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Large Model Weights (DO NOT commit to git, they are extremely heavy!)
+models/
+*.pth
+*.pt
+yolo26n.pt
+yolov8n.pt
+
+# Temporary Cache and Outputs
+temp/
+output/
+dataset/
+dataset_yolo/
+
+# Editor and System files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
