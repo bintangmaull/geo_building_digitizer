@@ -647,7 +647,7 @@ class Sidebar(ctk.CTkScrollableFrame):
         # ── 7. Footer ──────────────────────────────────
         ctk.CTkLabel(
             self,
-            text="SAM-Geo Building Digitizer v1.0\nGPU: NVIDIA RTX 3050 (CUDA)",
+            text="SAM-Geo Building Digitizer v1.2\nGPU: NVIDIA RTX 3050 (CUDA)",
             font=ctk.CTkFont(size=9),
             text_color="#1E293B",
             justify="center",

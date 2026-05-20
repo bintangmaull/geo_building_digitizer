@@ -577,8 +577,15 @@ class SAMProcessor:
             if self.mode == "yolo" and self._yolo:
                 import cv2
                 img = cv2.imread(tile_path)
-                # Run YOLO inference
-                yolo_results = self._yolo(img, verbose=False)
+                # Run YOLO inference with parameters optimized for dense small objects
+                yolo_results = self._yolo(
+                    img, 
+                    verbose=False,
+                    imgsz=max(img.shape[0], img.shape[1]), # Prevent downscaling to 640
+                    conf=0.15,                             # Lower confidence for small buildings
+                    iou=0.45,                              # Standard NMS threshold
+                    max_det=3000                           # Increase max detections from default 300
+                )
                 boxes = yolo_results[0].boxes.xyxy.cpu().numpy() # [x1, y1, x2, y2]
                 if len(boxes) > 0:
                     box_prompts = boxes.tolist()

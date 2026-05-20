@@ -3,7 +3,7 @@ title SAM-Geo Building Digitizer - Launcher
 color 0A
 
 echo ========================================
-echo   SAM-Geo Building Digitizer v1.0
+echo   SAM-Geo Building Digitizer v1.2
 echo   Digitasi Bangunan Otomatis dengan SAM
 echo ========================================
 echo.

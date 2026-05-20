@@ -3,7 +3,7 @@ title SAM-Geo Building Digitizer - Installer
 color 0B
 
 echo ========================================
-echo   SAM-Geo Building Digitizer v1.0
+echo   SAM-Geo Building Digitizer v1.2
 echo   Installer / Setup Script
 echo ========================================
 echo.
