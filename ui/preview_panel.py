@@ -81,17 +81,6 @@ class PreviewPanel(ctk.CTkFrame):
         )
         self.btn_maximize.pack(side="right", padx=(8, 4))
 
-    def toggle_maximize(self):
-        """Toggle maximized status of this preview panel."""
-        self.is_maximized = not self.is_maximized
-        if self.is_maximized:
-            self.btn_maximize.configure(text="🗖 Restore View")
-        else:
-            self.btn_maximize.configure(text="🗖 Maximize Preview")
-
-        if self.on_maximize_toggle:
-            self.on_maximize_toggle(self.is_maximized)
-
         # ── Matplotlib Canvas ────────────────────────────
         import matplotlib
         matplotlib.use("TkAgg")
@@ -140,6 +129,17 @@ class PreviewPanel(ctk.CTkFrame):
         self.canvas.mpl_connect("button_press_event", self._on_pan_start)
         self.canvas.mpl_connect("button_release_event", self._on_pan_end)
         self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+
+    def toggle_maximize(self):
+        """Toggle maximized status of this preview panel."""
+        self.is_maximized = not self.is_maximized
+        if self.is_maximized:
+            self.btn_maximize.configure(text="🗖 Restore View")
+        else:
+            self.btn_maximize.configure(text="🗖 Maximize Preview")
+
+        if self.on_maximize_toggle:
+            self.on_maximize_toggle(self.is_maximized)
 
     def _on_zoom(self, event):
         if event.inaxes != self.ax:

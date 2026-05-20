@@ -42,7 +42,7 @@ class SAMGeoApp(ctk.CTk):
     """Main application window."""
 
     APP_TITLE = "SAM-Geo Building Digitizer"
-    APP_VERSION = "1.0.0"
+    APP_VERSION = "1.1"
     MIN_WIDTH = 1200
     MIN_HEIGHT = 720
 

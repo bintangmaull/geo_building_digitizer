@@ -31,6 +31,11 @@ class SAMProcessor:
             "checkpoint": "sam_vit_b_01ec64.pth",
             "download_url": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",
         },
+        "SAM-B (Custom - Bangunan Lokal)": {
+            "type": "vit_b",
+            "checkpoint": "sam_bangunan_lokal.pth",
+            "download_url": None,
+        },
         "SAM-L (Akurat, ~1.2GB)": {
             "type": "vit_l",
             "checkpoint": "sam_vit_l_0b3195.pth",
@@ -143,6 +148,13 @@ class SAMProcessor:
         if os.path.isfile(model_path):
             self._log(f"Model sudah ada: {cfg['checkpoint']}")
             return model_path
+
+        # Jika file tidak ada dan tidak ada URL unduhan (model kustom), berikan error yang jelas
+        if not cfg.get("download_url"):
+            raise RuntimeError(
+                f"Model kustom '{cfg['checkpoint']}' tidak ditemukan di folder 'models'!\n"
+                "Silakan lakukan training model terlebih dahulu melalui panel di sidebar."
+            )
 
         self._log(f"Mengunduh model {self.model_name}...")
         self._log(f"URL: {cfg['download_url']}")
@@ -432,10 +444,10 @@ class SAMProcessor:
                 with rasterio.open(tile_path) as src:
                     h, w = src.height, src.width
                     meta = src.meta.copy()
-                    meta.update(dtype="uint8", count=1, nodata=0)
+                    meta.update(dtype="uint16", count=1, nodata=0)
                 
                 # Initialize master mask
-                master_mask = np.zeros((h, w), dtype=np.uint8)
+                master_mask = np.zeros((h, w), dtype=np.uint16)
                 
                 # Temp path for individual point/box prediction
                 temp_dir = os.path.dirname(output_mask_path)
@@ -444,7 +456,7 @@ class SAMProcessor:
                 # Loop through each prompt separately to prevent SAM from merging them
                 items_to_loop = box_prompts if self.mode == "yolo" else list(zip(point_coords, point_labels))
                 
-                for item in items_to_loop:
+                for idx, item in enumerate(items_to_loop):
                     if self.is_cancelled():
                         return False
                     
@@ -470,8 +482,9 @@ class SAMProcessor:
                         if os.path.exists(temp_point_path):
                             with rasterio.open(temp_point_path) as p_src:
                                 point_mask = p_src.read(1)
-                                # Merge into master mask
-                                master_mask = np.maximum(master_mask, point_mask)
+                                # Assign a unique ID to this building's pixels to keep them separate in vectorization
+                                building_id = idx + 1
+                                master_mask = np.where(point_mask > 0, building_id, master_mask)
                     except Exception as pe:
                         self._log(f"      ⚠️ Gagal segmentasi item {item}: {pe}", "warning")
                 
@@ -483,9 +496,8 @@ class SAMProcessor:
                         pass
                 
                 # Write final combined master mask to disk
-                master_mask = np.where(master_mask > 0, 255, 0).astype(np.uint8)
                 with rasterio.open(output_mask_path, "w", **meta) as dst:
-                    dst.write(master_mask, 1)
+                    dst.write(master_mask.astype(np.uint16), 1)
                     
             else:
                 try:

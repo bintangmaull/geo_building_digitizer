@@ -23,28 +23,37 @@ def mask_to_polygons(
     min_area_px: float = 2.0,
 ) -> "geopandas.GeoDataFrame":
     """
-    Convert a binary raster mask to vector polygons using rasterio's vectorize.
+    Convert a binary or instance raster mask to vector polygons using rasterio's vectorize.
+    Supports both binary masks and instance-aware (unique IDs) masks.
     Returns a GeoDataFrame with polygon geometries and CRS set.
     """
     import rasterio
     from rasterio.features import shapes
     import geopandas as gpd
     from shapely.geometry import shape
+    import numpy as np
 
     with rasterio.open(mask_path) as src:
         data = src.read(1)
         transform = src.transform
         crs = src.crs
 
-    # Binary mask: non-zero = building
-    binary = (data > 127).astype(np.uint8)
-
+    # Find unique non-zero values (each value represents a separate building instance)
+    unique_vals = np.unique(data)
     geoms = []
-    for geom_dict, val in shapes(binary, mask=binary, transform=transform):
-        if val == 1:
-            geom = shape(geom_dict)
-            if geom.area >= min_area_px:  # area in projected units (CRS-dependent)
-                geoms.append(geom)
+
+    for val in unique_vals:
+        if val == 0:
+            continue
+        
+        # Create a binary mask for this specific instance/value
+        instance_mask = (data == val).astype(np.uint8)
+        
+        for geom_dict, v in shapes(instance_mask, mask=instance_mask, transform=transform):
+            if v == 1:
+                geom = shape(geom_dict)
+                if geom.area >= min_area_px:  # area in projected units (CRS-dependent)
+                    geoms.append(geom)
 
     if not geoms:
         return gpd.GeoDataFrame(geometry=[], crs=crs)
@@ -411,19 +420,217 @@ def filter_shadows(
 # STEP 5: Polygon Regularization (Corner Snapping)
 # ──────────────────────────────────────────────
 
-def orthogonalize_polygon(geom, angle_tolerance_deg: float = 15.0, simplify_tol: float = 0.5):
+def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr):
     """
-    Regularize a single polygon to have more orthogonal (90°) corners.
-    
-    Process:
-    1. Simplify with Douglas-Peucker to remove micro-vertices
-    2. Snap near-90° and near-45° corners to exact angles
-    3. Fallback: minimum rotated bounding rectangle for very irregular shapes
+    Internal helper: Rotate-to-Align Orthogonalization.
+    Rotates the polygon to its dominant axis, simplifies, snaps orthogonal corners, rotates back.
+    """
+    from shapely.geometry import Polygon
+    from shapely.validation import make_valid
+    import math
 
-    Args:
-        geom: Shapely geometry
-        angle_tolerance_deg: Corners within this range of 90°/45°/0° are snapped
-        simplify_tol: Douglas-Peucker tolerance (in CRS units)
+    # A. Find the dominant angle from MBR
+    mbr_coords = list(mbr.exterior.coords)
+    if len(mbr_coords) >= 2:
+        dx = mbr_coords[1][0] - mbr_coords[0][0]
+        dy = mbr_coords[1][1] - mbr_coords[0][1]
+        angle = math.atan2(dy, dx)
+    else:
+        angle = 0.0
+
+    centroid = geom.centroid
+    cx, cy = centroid.x, centroid.y
+
+    def rotate_point(x, y, cx, cy, angle_rad):
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        nx = cos_a * (x - cx) - sin_a * (y - cy) + cx
+        ny = sin_a * (x - cx) + cos_a * (y - cy) + cy
+        return nx, ny
+
+    # B. Rotate to axis-aligned
+    rotated_coords = [rotate_point(x, y, cx, cy, -angle) for x, y in geom.exterior.coords]
+    rotated_geom = Polygon(rotated_coords)
+    rotated_geom = make_valid(rotated_geom)
+
+    # C. Simplify and regularize
+    # Use a base tolerance to remove jagged noise without destroying architecture
+    # In geographic degrees, actual_simplify_tol is very small (e.g., 2e-5)
+    # The threshold for "strict_straight" (tree detected) was set to 2.5 meters.
+    # We check if actual_simplify_tol corresponds to > 1.0 meters.
+    is_strict = False
+    if actual_simplify_tol > 1.0:
+        is_strict = True
+    elif actual_simplify_tol < 0.1 and actual_simplify_tol > (1.0 / 111320): 
+        # Geographic coordinates check
+        is_strict = True
+
+    base_tol = actual_simplify_tol * 0.2 if is_strict else actual_simplify_tol
+    simplified = rotated_geom.simplify(base_tol, preserve_topology=True)
+
+    # NEW: Axis-Aligned Mitre Closing for tree bites
+    # This mathematical trick swallows diagonal tree bites and restores perfect 90-degree corners,
+    # while preserving large H/V architectural features (L-shapes).
+    if is_strict and not simplified.is_empty:
+        # Mitre radius: 3.5 meters (or equivalent in degrees)
+        r_mitre = 3.5 if actual_simplify_tol > 0.1 else (3.5 / 111320)
+        try:
+            # join_style=2 is MITRE, cap_style=3 is SQUARE
+            simplified = simplified.buffer(r_mitre, join_style=2).buffer(-r_mitre, join_style=2)
+            simplified = make_valid(simplified)
+            # Clean up redundant vertices after closing
+            simplified = simplified.simplify(base_tol, preserve_topology=True)
+        except Exception:
+            pass
+
+    if simplified.is_empty:
+        simplified = rotated_geom
+
+    coords = list(simplified.exterior.coords[:-1])
+    n = len(coords)
+    if n < 4:
+        return None  # Signal caller to fall back to MBR
+
+    # Trigonometric threshold for H/V classification
+    # Use a wider tolerance to catch near-H/V edges 
+    snap_tol_deg = min(angle_tolerance_deg, 35.0)
+    rad_tol = math.radians(snap_tol_deg)
+    tan_tol = math.tan(rad_tol)
+
+    # D. Iterative edge forcing + corner snapping
+    # Pass 1: Force every edge to be exactly H or V if it is "close enough"
+    # This snaps diagonal edges caused by tree bites to the nearest axis.
+    def force_orthogonal(coords_in):
+        n_in = len(coords_in)
+        out = list(coords_in)
+        for i in range(n_in):
+            p_prev = out[(i - 1) % n_in]
+            p_curr = out[i]
+            p_next = out[(i + 1) % n_in]
+
+            dx_in  = p_curr[0] - p_prev[0]
+            dy_in  = p_curr[1] - p_prev[1]
+            dx_out = p_next[0] - p_curr[0]
+            dy_out = p_next[1] - p_curr[1]
+
+            in_horiz = abs(dy_in)  <= abs(dx_in)  * tan_tol if abs(dx_in)  > 1e-12 else False
+            in_vert  = abs(dx_in)  <= abs(dy_in)  * tan_tol if abs(dy_in)  > 1e-12 else False
+            out_horiz = abs(dy_out) <= abs(dx_out) * tan_tol if abs(dx_out) > 1e-12 else False
+            out_vert  = abs(dx_out) <= abs(dy_out) * tan_tol if abs(dy_out) > 1e-12 else False
+
+            # Snap corner: prefer to preserve the incoming direction, adjust current point
+            if in_horiz and out_vert:
+                # Incoming is horizontal → fix Y of current to match prev Y
+                # Outgoing is vertical  → fix X of current to match next X
+                out[i] = (p_next[0], p_prev[1])
+            elif in_vert and out_horiz:
+                # Incoming is vertical   → fix X of current to match prev X
+                # Outgoing is horizontal → fix Y of current to match next Y
+                out[i] = (p_prev[0], p_next[1])
+            elif in_horiz and not out_vert:
+                # Incoming horiz, outgoing is diagonal → project current onto horizontal
+                out[i] = (p_curr[0], p_prev[1])
+            elif in_vert and not out_horiz:
+                # Incoming vert, outgoing is diagonal → project current onto vertical
+                out[i] = (p_prev[0], p_curr[1])
+        return out
+
+    new_coords = coords
+    # Iterate up to 8 times to allow snapping to propagate
+    for _iteration in range(8):
+        prev = list(new_coords)
+        new_coords = force_orthogonal(new_coords)
+        if new_coords == prev:
+            break  # Converged
+
+    # FINAL BRUTAL PASS: Force ALL remaining diagonal edges to nearest H or V axis.
+    # No tolerance check — every edge that is not perfectly H or V gets snapped.
+    # This guarantees true 90-degree corners on the output polygon.
+    def force_all_to_hv(coords_in):
+        n_in = len(coords_in)
+        out = list(coords_in)
+        changed = True
+        passes = 0
+        while changed and passes < 10:
+            changed = False
+            passes += 1
+            for i in range(n_in):
+                p_prev = out[(i - 1) % n_in]
+                p_curr = out[i]
+                p_next = out[(i + 1) % n_in]
+
+                dx_in  = p_curr[0] - p_prev[0]
+                dy_in  = p_curr[1] - p_prev[1]
+                dx_out = p_next[0] - p_curr[0]
+                dy_out = p_next[1] - p_curr[1]
+
+                # Classify each edge: H if |dy|<|dx|, V if |dx|<|dy|
+                in_horiz  = abs(dy_in)  <= abs(dx_in)
+                in_vert   = abs(dx_in)  <  abs(dy_in)
+                out_horiz = abs(dy_out) <= abs(dx_out)
+                out_vert  = abs(dx_out) <  abs(dy_out)
+
+                new_pt = out[i]
+                if in_horiz and out_vert:
+                    new_pt = (p_next[0], p_prev[1])
+                elif in_vert and out_horiz:
+                    new_pt = (p_prev[0], p_next[1])
+                elif in_horiz and not out_vert:
+                    # Both horizontal → share same Y, keep X as-is
+                    new_pt = (p_curr[0], p_prev[1])
+                elif in_vert and not out_horiz:
+                    # Both vertical → share same X, keep Y as-is
+                    new_pt = (p_prev[0], p_curr[1])
+
+                if new_pt != out[i]:
+                    out[i] = new_pt
+                    changed = True
+        return out
+
+    new_coords = force_all_to_hv(new_coords)
+
+    # Remove degenerate (duplicate) points
+    clean = []
+    for pt in new_coords:
+        if not clean or (abs(pt[0] - clean[-1][0]) > 1e-10 or abs(pt[1] - clean[-1][1]) > 1e-10):
+            clean.append(pt)
+    new_coords = clean if len(clean) >= 4 else new_coords
+
+    new_coords.append(new_coords[0])
+
+
+    # E. Rotate back
+    final_coords = [rotate_point(x, y, cx, cy, angle) for x, y in new_coords]
+    final_geom = make_valid(Polygon(final_coords))
+
+    if final_geom.is_valid and not final_geom.is_empty and final_geom.area > 0:
+        return final_geom
+    return None
+
+
+
+def orthogonalize_polygon(geom, angle_tolerance_deg: float = 25.0, simplify_tol: float = 0.25,
+                          closing_radius: float = 0.35, strict_straight: bool = False):
+    """
+    Regularize a building polygon to have orthogonal (90°) corners while
+    preserving the actual shape (L/U/compound) and healing tree-caused indents.
+
+    Pipeline:
+
+    Step A – Morphological Closing (r=1.0m):
+        Fills tree-caused concavities narrower than 2m.
+        Preserves real architectural features wider than 2m (L-shape steps etc).
+
+    Step B – Post-close MBR snap (strict):
+        Only snap to MBR if the healed shape is already near-perfect rectangle
+        (IoU >= 0.87 AND Solidity >= 0.93). L-shapes and compound buildings pass
+        through to Step C.
+
+    Step C – Simplify 0.4m + RTA Orthogonalization:
+        Simplify removes SAM pixelation noise while keeping all
+        architectural corners. RTA snaps corners within the tolerance angle to exact 90°.
+
+    Fallback – Shape-preserving simplified geometry for complex buildings, or MBR for simple boxes.
     """
     from shapely.geometry import Polygon, MultiPolygon
     from shapely.validation import make_valid
@@ -432,95 +639,95 @@ def orthogonalize_polygon(geom, angle_tolerance_deg: float = 15.0, simplify_tol:
     if geom is None or geom.is_empty:
         return geom
 
-    # Handle multi-polygons: process each part
+    # Handle multi-polygons
     if isinstance(geom, MultiPolygon):
-        parts = [orthogonalize_polygon(p, angle_tolerance_deg, simplify_tol) for p in geom.geoms]
+        parts = [orthogonalize_polygon(p, angle_tolerance_deg, simplify_tol, closing_radius, strict_straight)
+                 for p in geom.geoms]
         parts = [p for p in parts if p and not p.is_empty]
         if not parts:
             return geom
-        if len(parts) == 1:
-            return parts[0]
-        return MultiPolygon(parts)
+        return parts[0] if len(parts) == 1 else MultiPolygon(parts)
 
     try:
-        # Step 1: Simplify (Douglas-Peucker)
-        simplified = geom.simplify(simplify_tol, preserve_topology=True)
-        if simplified.is_empty:
-            simplified = geom
-
-        coords = list(simplified.exterior.coords[:-1])  # Remove closing vertex
-        n = len(coords)
-
-        if n < 3:
-            return geom
-
-        # Step 2: Snap corners to 90°/45° angles
-        def angle_between(p1, p2, p3):
-            """Angle at p2 between vectors p1→p2 and p2→p3 (in degrees)."""
-            v1 = (p1[0] - p2[0], p1[1] - p2[1])
-            v2 = (p3[0] - p2[0], p3[1] - p2[1])
-            dot = v1[0]*v2[0] + v1[1]*v2[1]
-            mag1 = math.sqrt(v1[0]**2 + v1[1]**2)
-            mag2 = math.sqrt(v2[0]**2 + v2[1]**2)
-            if mag1 == 0 or mag2 == 0:
-                return 90.0
-            cos_val = max(-1.0, min(1.0, dot / (mag1 * mag2)))
-            return math.degrees(math.acos(cos_val))
-
-        # For each vertex, check if angle is close to 90°
-        new_coords = list(coords)
-        tol = angle_tolerance_deg
-
-        for i in range(n):
-            p_prev = coords[(i - 1) % n]
-            p_curr = coords[i]
-            p_next = coords[(i + 1) % n]
-            angle = angle_between(p_prev, p_curr, p_next)
-
-            # Check snap targets: 90° or 180° (straight)
-            for target in [90.0, 180.0]:
-                if abs(angle - target) <= tol:
-                    # Snap: recalculate p_curr to make exact angle
-                    # Simple approach: project p_curr onto perpendicular from p_prev to segment
-                    # Direction of incoming edge
-                    dx_in = p_curr[0] - p_prev[0]
-                    dy_in = p_curr[1] - p_prev[1]
-                    len_in = math.sqrt(dx_in**2 + dy_in**2)
-                    if len_in == 0:
-                        break
-                    # Unit vector of incoming edge
-                    ux, uy = dx_in / len_in, dy_in / len_in
-                    # Perpendicular (90° snap): outgoing edge should be perpendicular
-                    if target == 90.0:
-                        # Project p_next onto perpendicular direction from p_curr
-                        perp_x, perp_y = -uy, ux
-                        dx_out = p_next[0] - p_curr[0]
-                        dy_out = p_next[1] - p_curr[1]
-                        proj = dx_out * perp_x + dy_out * perp_y
-                        # Snapped next point
-                        snapped_next = (p_curr[0] + proj * perp_x, p_curr[1] + proj * perp_y)
-                        new_coords[(i + 1) % n] = snapped_next
-                    break
-
-        # Reconstruct polygon
-        new_coords.append(new_coords[0])  # Close ring
+        # Step 0 – Geographic coordinate safeguard
+        is_geographic = False
         try:
-            new_geom = Polygon(new_coords)
-            new_geom = make_valid(new_geom)
-            if new_geom.is_valid and not new_geom.is_empty and new_geom.area > 0:
-                return new_geom
+            c = geom.centroid
+            if abs(c.x) <= 180.0 and abs(c.y) <= 90.0:
+                minx, miny, maxx, maxy = geom.bounds
+                if (maxx - minx) < 0.1 and (maxy - miny) < 0.1:
+                    is_geographic = True
         except Exception:
             pass
 
-        # Step 3 Fallback: minimum rotated rectangle
+        # Increase the baseline simplification to flatten out the 30cm-50cm pixel steps
+        baseline_simplify = max(simplify_tol, 0.25)
+        
+        if strict_straight:
+            # Force high tolerance to ignore tree indentations and "tabrak lurus"
+            # We ONLY increase simplify tolerance. We DO NOT increase closing_radius 
+            # because a large round buffer destroys 90-degree corners and skews the MBR angle!
+            baseline_simplify = max(baseline_simplify, 2.5)
+            
+        actual_simplify_tol   = baseline_simplify
+        actual_closing_radius = closing_radius
+        if is_geographic:
+            # 1 degree ≈ 111,320 m → scale meters to degrees
+            actual_simplify_tol   = baseline_simplify   / 111_320
+            actual_closing_radius = closing_radius  / 111_320
+
+        # ── Step A: Morphological Closing ────────────────────────────────────────────
+        working_geom = geom
         try:
+            closed = (geom
+                      .buffer(actual_closing_radius)
+                      .buffer(-actual_closing_radius))
+            closed = make_valid(closed)
+            if closed and not closed.is_empty and closed.area > 0:
+                # Allow up to 60% area growth (tree cover ≤ ~37% of building area)
+                if closed.area / geom.area <= 1.6:
+                    working_geom = closed
+        except Exception:
+            pass  # Keep raw geom if buffer fails
+
+        # Compute MBR of the working (healed) geometry
+        mbr = working_geom.minimum_rotated_rectangle
+        if not mbr or mbr.is_empty or mbr.area == 0:
             mbr = geom.minimum_rotated_rectangle
-            if mbr and not mbr.is_empty and mbr.area > 0:
-                return mbr
-        except Exception:
-            pass
+            if not mbr or mbr.is_empty:
+                return geom
 
-        return geom
+        # ── Step B: Post-close MBR Snap ──────────────────────────────────────────────
+        inter_area = working_geom.intersection(mbr).area
+        union_area  = working_geom.union(mbr).area
+        iou      = inter_area / union_area if union_area > 0 else 0
+        solidity = (working_geom.area / working_geom.convex_hull.area
+                    if working_geom.convex_hull.area > 0 else 0)
+
+        # Strict threshold: only rectangularize near-perfect boxes,
+        # let L/U/compound shapes proceed to RTA orthogonalization.
+        if iou >= 0.87 and solidity >= 0.93:
+            return mbr
+
+        # ── Step C: Simplify + RTA Orthogonalization ────────────────────────────
+        result = _rta_orthogonalize(working_geom, angle_tolerance_deg, actual_simplify_tol, mbr)
+        if result is not None:
+            return result
+
+        # ── Shape-Preserving Fallback ──
+        # If the building has complex geometry (L/U/T-shape or irregular) and RTA fails,
+        # DO NOT squash it to MBR box. Return a simplified, cleaned version of the original shape.
+        if iou < 0.85 or solidity < 0.90:
+            try:
+                simplified = working_geom.simplify(actual_simplify_tol * 0.8, preserve_topology=True)
+                simplified = make_valid(simplified)
+                if simplified and not simplified.is_empty and simplified.area > 0:
+                    return simplified
+            except Exception:
+                pass
+
+        # ── Fallback: MBR ─────────────────────────────────────────────────────────────
+        return mbr
 
     except Exception:
         return geom
@@ -528,9 +735,11 @@ def orthogonalize_polygon(geom, angle_tolerance_deg: float = 15.0, simplify_tol:
 
 def regularize_polygons(
     gdf: "geopandas.GeoDataFrame",
+    raster_path: str = None,
+    greenness_threshold: float = 15.0,
     enable: bool = True,
-    angle_tolerance: float = 15.0,
-    simplify_tolerance: float = 0.5,
+    angle_tolerance: float = 20.0,
+    simplify_tolerance: float = 0.25,
     log_callback: Optional[Callable[[str], None]] = None,
 ) -> "geopandas.GeoDataFrame":
     """Apply orthogonalization to all polygons in a GeoDataFrame."""
@@ -541,9 +750,66 @@ def regularize_polygons(
 
     log(f"Regularisasi sudut poligon (toleransi={angle_tolerance}°)...")
     gdf = gdf.copy()
-    gdf["geometry"] = gdf["geometry"].apply(
-        lambda g: orthogonalize_polygon(g, angle_tolerance, simplify_tolerance)
-    )
+    
+    import rasterio
+    from rasterio.mask import mask as rio_mask
+    from shapely.geometry import mapping
+    import numpy as np
+
+    is_geographic = False
+    if gdf.crs and gdf.crs.is_geographic:
+        is_geographic = True
+    buf_dist = 2.5 / 111320.0 if is_geographic else 2.5
+
+    src = None
+    gdf_raster = gdf
+    if raster_path:
+        try:
+            src = rasterio.open(raster_path)
+            raster_crs = src.crs
+            if gdf.crs and gdf.crs != raster_crs:
+                gdf_raster = gdf.to_crs(raster_crs)
+        except Exception as e:
+            log(f"Gagal membuka raster untuk deteksi pohon: {e}")
+            src = None
+
+    new_geoms = []
+    for geom, raster_geom in zip(gdf.geometry, gdf_raster.geometry):
+        strict_straight = False
+        if src is not None:
+            try:
+                # Buffer to catch nearby trees overlapping or touching the boundary
+                check_geom = raster_geom.buffer(buf_dist)
+                out_image, _ = rio_mask(src, [mapping(check_geom)], crop=True, nodata=0)
+                if out_image.shape[0] >= 3:
+                    r = out_image[0].astype(float)
+                    g = out_image[1].astype(float)
+                    b = out_image[2].astype(float)
+                    valid = r > 0
+                    if valid.sum() > 0:
+                        r_v = r[valid]
+                        g_v = g[valid]
+                        b_v = b[valid]
+                        # Hitung greenness per piksel, bukan rata-rata
+                        greenness = g_v - np.maximum(r_v, b_v)
+                        
+                        # Hitung berapa persentase area yang merupakan pohon
+                        tree_pixels = (greenness > greenness_threshold).sum()
+                        tree_ratio = tree_pixels / valid.sum()
+                        
+                        # Jika lebih dari 5% area buffer adalah pohon, paksa jadi kotak lurus
+                        if tree_ratio > 0.05:
+                            strict_straight = True
+            except Exception:
+                pass
+        
+        new_geoms.append(orthogonalize_polygon(geom, angle_tolerance, simplify_tolerance, strict_straight=strict_straight))
+
+    if src is not None:
+        src.close()
+
+    gdf["geometry"] = new_geoms
+
     # Remove invalid geometries after regularization
     gdf = gdf[gdf.geometry.is_valid & ~gdf.geometry.is_empty].reset_index(drop=True)
     log(f"Regularisasi selesai. Poligon valid: {len(gdf)}")
@@ -802,8 +1068,15 @@ def run_postprocess_pipeline(
 
     # 5. Regularization
     if enable_regularization:
-        progress(91, "Regularisasi sudut poligon bangunan...")
-        gdf = regularize_polygons(gdf, enable=True, angle_tolerance=angle_tolerance, log_callback=log)
+        progress(91, "Regularisasi sudut poligon bangunan (dengan deteksi pohon)...")
+        gdf = regularize_polygons(
+            gdf, 
+            raster_path=original_raster_path,
+            greenness_threshold=greenness_threshold,
+            enable=True, 
+            angle_tolerance=angle_tolerance, 
+            log_callback=log
+        )
 
     # 6. Resolve overlaps (avoid overlap)
     progress(93, "Menghilangkan poligon tumpang tindih (avoid overlap)...")

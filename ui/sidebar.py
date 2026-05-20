@@ -24,6 +24,7 @@ class Sidebar(ctk.CTkScrollableFrame):
         "SAM2-Large (Sangat Akurat, ~898MB)",
         # ── SAM1 (Generasi Pertama) ──
         "SAM-B (Seimbang, ~375MB)",
+        "SAM-B (Custom - Bangunan Lokal)",
         "MobileSAM (Cepat, ~40MB)",
         "SAM-L (Akurat, ~1.2GB)",
         "SAM-H (Sangat Akurat, ~2.4GB)",
