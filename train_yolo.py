@@ -10,9 +10,10 @@ from typing import Callable, Optional
 
 def train_yolo_model(
     dataset_dir: str,
-    epochs: int = 15,
+    epochs: int = 100,
     batch_size: int = 4,
-    base_model: str = "yolov8n.pt",
+    base_model: str = "yolo12n.pt",
+    output_model_name: str = "yolo_bangunan_lokal.pt",
     log_callback: Optional[Callable[[str], None]] = None,
     progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> bool:
@@ -23,7 +24,7 @@ def train_yolo_model(
     progress = progress_callback or (lambda p, m: None)
 
     try:
-        log(f"🧠 Menginisialisasi training YOLOv8 dengan base model {base_model}...")
+        log(f"🧠 Menginisialisasi training YOLO dengan base model {base_model}...")
         progress(72, "Memuat model ultralytics YOLO...")
 
         try:
@@ -69,10 +70,11 @@ def train_yolo_model(
             project=models_dir,
             name="yolo_train_run",
             exist_ok=True, # overwrite previous run
-            device="0" # use GPU 0, will fallback to cpu if fail usually but ultralytics handles it
+            device="0", # use GPU 0, will fallback to cpu if fail usually but ultralytics handles it
+            workers=0 # Fix for Windows WinError 1455 (pagefile too small)
         )
         
-        output_model_path = os.path.join(models_dir, "yolo_bangunan_lokal.pt")
+        output_model_path = os.path.join(models_dir, output_model_name)
         trained_weights = os.path.join(models_dir, "yolo_train_run", "weights", "best.pt")
         
         if os.path.exists(trained_weights):

@@ -17,15 +17,26 @@ class PreviewPanel(ctk.CTkFrame):
     Displays the input raster with overlay of detected polygons.
     """
 
+    # Warna per kelas objek (konsisten dengan sidebar checkbox)
+    OBJECT_COLORS = {
+        "Bangunan":  {"face": "#00D4FF", "edge": "#67E8F9"},
+        "Jalan":     {"face": "#FF6B35", "edge": "#FFA07A"},
+        "Badan Air": {"face": "#3B82F6", "edge": "#93C5FD"},
+        "Vegetasi":  {"face": "#22C55E", "edge": "#86EFAC"},
+    }
+
     def __init__(self, parent, on_maximize_toggle=None, **kwargs):
         super().__init__(parent, **kwargs)
         self._raster_path: Optional[str] = None
-        self._gdf = None         # GeoDataFrame with result polygons
+        self._gdf = None         # GeoDataFrame with result polygons (bangunan)
+        self._multi_gdf = None   # GeoDataFrame multi-objek (dengan kolom 'class')
         self._yolo_boxes = None  # List of YOLO boxes (geo coords)
         self._tiles = []         # List of tile rects
         self._active_tile_idx = -1
         self._raster_array = None  # Cached preview image
         self._raster_extent = None  # (left, right, bottom, top)
+        self._aoi_polygon = None   # AOI polygon coords (list of (x, y) in raster CRS)
+        self._show_yolo_boxes = True # Dynamic toggle for YOLO boxes layer
         self.on_maximize_toggle = on_maximize_toggle
         self.is_maximized = False
         self._build_ui()
@@ -297,7 +308,24 @@ class PreviewPanel(ctk.CTkFrame):
             )
 
         import matplotlib.patches as patches
-        
+
+        # Draw AOI polygon overlay (from WMS download)
+        if self._aoi_polygon and len(self._aoi_polygon) >= 3:
+            try:
+                from matplotlib.patches import Polygon as MplPolygon
+                aoi_arr = np.array(self._aoi_polygon)
+                aoi_patch = MplPolygon(
+                    aoi_arr, closed=True,
+                    linewidth=2.5, edgecolor="#FBBF24",
+                    facecolor="#FBBF2420", linestyle="--",
+                )
+                self.ax.add_patch(aoi_patch)
+                # Draw corner markers
+                for x, y in self._aoi_polygon[:-1]:  # skip closing point
+                    self.ax.plot(x, y, 'o', color="#F59E0B", markersize=5, zorder=5)
+            except Exception:
+                pass
+
         # Draw tile grid (light gray outline)
         if self._tiles and self._raster_extent:
             for i, (x0, y0, x1, y1) in enumerate(self._tiles):
@@ -312,7 +340,7 @@ class PreviewPanel(ctk.CTkFrame):
                 )
                 self.ax.add_patch(rect)
 
-        # Draw polygon overlay
+        # Draw polygon overlay — Bangunan (merah muda, dari pipeline bangunan)
         if self._gdf is not None and len(self._gdf) > 0:
             try:
                 import matplotlib.patches as mpatches
@@ -338,17 +366,16 @@ class PreviewPanel(ctk.CTkFrame):
                 if polys:
                     collection = PatchCollection(
                         polys,
-                        facecolor="#F43F5E",
-                        edgecolor="#FCA5A5",
-                        alpha=0.35,
-                        linewidth=0.8,
+                        facecolor="none",
+                        edgecolor="#67E8F9",
+                        alpha=0.9,
+                        linewidth=2.5,
                     )
                     self.ax.add_collection(collection)
 
                 # Draw YOLO bounding boxes if any
-                if self._yolo_boxes:
+                if self._yolo_boxes and getattr(self, "_show_yolo_boxes", True):
                     for bx in self._yolo_boxes:
-                        # bx is [xmin, ymin, xmax, ymax]
                         rect = patches.Rectangle(
                             (bx[0], bx[1]), bx[2] - bx[0], bx[3] - bx[1],
                             linewidth=1.2, edgecolor="#EF4444", facecolor="none",
@@ -361,6 +388,58 @@ class PreviewPanel(ctk.CTkFrame):
                 )
             except Exception as e:
                 self.lbl_count.configure(text=f"Overlay error: {e}")
+
+        # Draw multi-object overlay — tiap kelas warna berbeda
+        if self._multi_gdf is not None and len(self._multi_gdf) > 0:
+            try:
+                from matplotlib.patches import Polygon as MplPolygon
+                from matplotlib.collections import PatchCollection
+                from shapely.geometry import MultiPolygon
+
+                classes = self._multi_gdf["class"].unique() if "class" in self._multi_gdf.columns else ["Unknown"]
+                total_multi = 0
+
+                for cls in classes:
+                    if "class" in self._multi_gdf.columns:
+                        sub_gdf = self._multi_gdf[self._multi_gdf["class"] == cls]
+                    else:
+                        sub_gdf = self._multi_gdf
+
+                    colors = self.OBJECT_COLORS.get(cls, {"face": "#A78BFA", "edge": "#C4B5FD"})
+                    polys = []
+
+                    for geom in sub_gdf.geometry:
+                        if geom is None or geom.is_empty:
+                            continue
+                        if isinstance(geom, MultiPolygon):
+                            for part in geom.geoms:
+                                polys.append(MplPolygon(np.array(part.exterior.coords), closed=True))
+                        else:
+                            try:
+                                polys.append(MplPolygon(np.array(geom.exterior.coords), closed=True))
+                            except Exception:
+                                pass
+
+                    if polys:
+                        collection = PatchCollection(
+                            polys,
+                            facecolor="none",
+                            edgecolor=colors["edge"],
+                            alpha=0.9,
+                            linewidth=2.5,
+                        )
+                        self.ax.add_collection(collection)
+                    total_multi += len(sub_gdf)
+
+                # Tampilkan ringkasan kelas di stats bar
+                cls_summary = " | ".join(
+                    f"{cls}: {len(self._multi_gdf[self._multi_gdf['class'] == cls]) if 'class' in self._multi_gdf.columns else total_multi}"
+                    for cls in classes
+                )
+                self.lbl_count.configure(text=f"✅ {total_multi:,} poligon | {cls_summary}")
+
+            except Exception as e:
+                self.lbl_count.configure(text=f"Multi-overlay error: {e}")
 
         self.canvas.draw_idle()
 
@@ -378,17 +457,48 @@ class PreviewPanel(ctk.CTkFrame):
         self.lbl_tile_status.configure(text=f"Tile {idx+1}" if idx >= 0 else "")
         self._redraw()
 
+    def toggle_yolo_boxes(self, show: bool):
+        """Dynamically show/hide the YOLO bounding box layer."""
+        self._show_yolo_boxes = show
+        self._redraw()
+
+    def set_aoi_polygon(self, polygon_coords):
+        """
+        Display the AOI polygon boundary as an overlay on the preview.
+        polygon_coords: list of (x, y) tuples in raster CRS (e.g. EPSG:3857 or lon/lat)
+        """
+        self._aoi_polygon = polygon_coords
+        self._redraw()
+
+    def clear_aoi_polygon(self):
+        """Remove the AOI polygon overlay."""
+        self._aoi_polygon = None
+        self._redraw()
+
     def set_result_polygons(self, gdf, yolo_boxes=None):
-        """Display result polygons as overlay."""
+        """Display building result polygons as overlay (pipeline bangunan)."""
         self._gdf = gdf
         self._yolo_boxes = yolo_boxes
+        self._multi_gdf = None   # Reset multi-object overlay
+        self._active_tile_idx = -1
+        self._redraw()
+
+    def set_multi_object_polygons(self, multi_gdf):
+        """
+        Tampilkan hasil digitasi multi-objek dengan warna berbeda per kelas.
+        multi_gdf: GeoDataFrame dengan kolom 'class' berisi nama objek
+                   ("Jalan", "Badan Air", "Vegetasi")
+        """
+        self._multi_gdf = multi_gdf
         self._active_tile_idx = -1
         self._redraw()
 
     def clear_results(self):
-        """Remove polygon overlay."""
+        """Remove polygon overlay (bangunan dan multi-objek)."""
         self._gdf = None
+        self._multi_gdf = None
         self._yolo_boxes = None
+        self._aoi_polygon = None
         self._active_tile_idx = -1
         self.lbl_count.configure(text="")
         self.lbl_tile_status.configure(text="")

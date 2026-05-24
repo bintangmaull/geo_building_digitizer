@@ -20,7 +20,6 @@ from pathlib import Path
 
 def mask_to_polygons(
     mask_path: str,
-    min_area_px: float = 2.0,
 ) -> "geopandas.GeoDataFrame":
     """
     Convert a binary or instance raster mask to vector polygons using rasterio's vectorize.
@@ -38,9 +37,9 @@ def mask_to_polygons(
         transform = src.transform
         crs = src.crs
 
-    # Find unique non-zero values (each value represents a separate building instance)
     unique_vals = np.unique(data)
     geoms = []
+    ids = []
 
     for val in unique_vals:
         if val == 0:
@@ -52,13 +51,13 @@ def mask_to_polygons(
         for geom_dict, v in shapes(instance_mask, mask=instance_mask, transform=transform):
             if v == 1:
                 geom = shape(geom_dict)
-                if geom.area >= min_area_px:  # area in projected units (CRS-dependent)
-                    geoms.append(geom)
+                geoms.append(geom)
+                ids.append(val)
 
     if not geoms:
         return gpd.GeoDataFrame(geometry=[], crs=crs)
-
-    gdf = gpd.GeoDataFrame(geometry=geoms, crs=crs)
+        
+    gdf = gpd.GeoDataFrame({"geometry": geoms, "building_id": ids}, crs=crs)
     return gdf
 
 
@@ -96,11 +95,11 @@ def merge_tile_masks(
         if not os.path.isfile(mask_path):
             continue
         try:
-            gdf = mask_to_polygons(mask_path, min_area_px)
-            if len(gdf) > 0:
+            gdf = mask_to_polygons(mask_path)
+            if not gdf.empty:
                 all_gdfs.append(gdf)
         except Exception as e:
-            log(f"  Gagal vektorisasi {Path(mask_path).name}: {e}")
+            log(f"Gagal memproses {mask_path}: {e}")
 
     if not all_gdfs:
         log("Tidak ada poligon yang berhasil diekstrak dari mask")
@@ -114,47 +113,33 @@ def merge_tile_masks(
 
     log(f"Total poligon sebelum deduplication: {len(gdf)}")
 
-    # Spatial NMS: hanya hapus duplikat dari area overlap antar tile
-    # TIDAK melakukan unary_union karena bisa merge bangunan yang berdampingan
-    gdf = gdf.reset_index(drop=True)
+    # Group polygons by building_id (Global YOLO Box ID)
+    # This perfectly merges halves of buildings cut by tile boundaries, WITHOUT merging distinct adjacent buildings!
+    final_geoms = []
+    
+    if "building_id" in gdf.columns:
+        for b_id, group in gdf.groupby("building_id"):
+            union_geom = group.geometry.unary_union
+            
+            # Explode if necessary
+            from shapely.geometry import MultiPolygon, Polygon, GeometryCollection
+            if isinstance(union_geom, Polygon):
+                final_geoms.append(union_geom)
+            elif isinstance(union_geom, MultiPolygon):
+                final_geoms.extend(list(union_geom.geoms))
+            elif isinstance(union_geom, GeometryCollection):
+                for geom in union_geom.geoms:
+                    if isinstance(geom, Polygon):
+                        final_geoms.append(geom)
+                    elif isinstance(geom, MultiPolygon):
+                        final_geoms.extend(list(geom.geoms))
+    else:
+        final_geoms = list(gdf.geometry)
 
-    try:
-        from shapely.geometry import MultiPolygon, Polygon
-
-        # Fix invalid geometries
-        gdf["geometry"] = gdf.geometry.buffer(0)
-
-        # IOU-based deduplication:
-        # Hapus polygon B jika IoU(A,B) > threshold (artinya B adalah duplikat A dari tile overlap)
-        keep = [True] * len(gdf)
-        geoms = list(gdf.geometry)
-
-        for i in range(len(geoms)):
-            if not keep[i]:
-                continue
-            for j in range(i + 1, len(geoms)):
-                if not keep[j]:
-                    continue
-                try:
-                    inter = geoms[i].intersection(geoms[j]).area
-                    if inter == 0:
-                        continue
-                    union = geoms[i].union(geoms[j]).area
-                    iou = inter / union if union > 0 else 0
-                    if iou > 0.5:  # >50% overlap = duplikat tile
-                        keep[j] = False
-                except Exception:
-                    pass
-
-        keep_indices = [k for k, v in enumerate(keep) if v]
-        final_gdf = gdf.iloc[keep_indices].copy()
-        final_gdf = final_gdf[final_gdf.geometry.area >= min_area_px]
-        final_gdf = final_gdf.reset_index(drop=True)
-        log(f"Poligon setelah deduplication: {len(final_gdf)}")
-        return final_gdf
-    except Exception as e:
-        log(f"Deduplication gagal, menggunakan data mentah: {e}")
-        return gdf
+    final_gdf = gpd.GeoDataFrame(geometry=final_geoms, crs=gdf.crs)
+    final_gdf = final_gdf.reset_index(drop=True)
+    log(f"Poligon setelah deduplication: {len(final_gdf)}")
+    return final_gdf
 
 
 # ──────────────────────────────────────────────
@@ -429,14 +414,66 @@ def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr):
     from shapely.validation import make_valid
     import math
 
-    # A. Find the dominant angle from MBR
-    mbr_coords = list(mbr.exterior.coords)
-    if len(mbr_coords) >= 2:
-        dx = mbr_coords[1][0] - mbr_coords[0][0]
-        dy = mbr_coords[1][1] - mbr_coords[0][1]
-        angle = math.atan2(dy, dx)
-    else:
-        angle = 0.0
+    # A. Calculate the True Architectural Angle
+    # MBR is highly unstable for L-shapes, T-shapes, and buildings with tree protrusions.
+    # We simplify the mask to remove pixel staircases, then find the dominant angle using an edge-length histogram.
+    angle = 0.0
+    try:
+        angle_simplify_tol = 0.2 if actual_simplify_tol > 0.1 else (0.2 / 111320)
+        pre_simplified = geom.simplify(angle_simplify_tol, preserve_topology=True)
+        coords = list(pre_simplified.exterior.coords)
+        buckets = {}
+        for i in range(len(coords) - 1):
+            dx = coords[i+1][0] - coords[i][0]
+            dy = coords[i+1][1] - coords[i][1]
+            length = math.hypot(dx, dy)
+            if length < angle_simplify_tol: continue # Ignore tiny artifact edges
+            
+            deg = math.degrees(math.atan2(dy, dx)) % 90.0
+            
+            # Penalize perfect H/V edges because they are highly likely to be artificial YOLO crop lines.
+            # True H/V buildings will still easily win since 100% of their edges are H/V.
+            is_perfect_hv = abs(dx) < 1e-8 or abs(dy) < 1e-8
+            weight_multiplier = 0.5 if is_perfect_hv else 1.0
+            
+            # Distribute length across adjacent bins (smoothing) to prevent noisy straight edges
+            # from splitting across multiple bins (e.g., 88, 89, 0, 1, 2) and losing to a single diagonal edge.
+            for offset in range(-3, 4):
+                bin_idx = int(round(deg + offset)) % 90
+                # Give highest weight to the exact center, lower to the edges
+                weight = length * (4 - abs(offset)) * weight_multiplier
+                buckets[bin_idx] = buckets.get(bin_idx, 0) + weight
+            
+        if buckets:
+            best_bin = 0
+            max_val = -1
+            for b_idx, val in buckets.items():
+                if val > max_val:
+                    max_val = val
+                    best_bin = b_idx
+                    
+            hist_angle_deg = best_bin
+            angle = math.radians(hist_angle_deg)
+        else:
+            raise ValueError("No valid edges found")
+            
+    except Exception as e:
+        print(f"DEBUG RTA: Exception in angle calc: {e}")
+        # Fallback to MBR if anything fails
+        mbr_coords = list(mbr.exterior.coords)
+        max_len = -1.0
+        for i in range(4):
+            dx = mbr_coords[i+1][0] - mbr_coords[i][0]
+            dy = mbr_coords[i+1][1] - mbr_coords[i][1]
+            length = math.hypot(dx, dy)
+            if length > max_len:
+                max_len = length
+                angle = math.atan2(dy, dx)
+                
+    # Normalize angle to -45..45 degrees
+    angle = angle % (math.pi / 2)
+    if angle > math.pi / 4:
+        angle -= math.pi / 2
 
     centroid = geom.centroid
     cx, cy = centroid.x, centroid.y
@@ -598,6 +635,22 @@ def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr):
 
     new_coords.append(new_coords[0])
 
+    # MBR Healing: If the building is a rectangle that was cropped by YOLO,
+    # its corners are missing (chamfered). But since we are now rotated to its true
+    # architectural angle, its bounding box perfectly reconstructs the missing corners!
+    orthogonalized_geom = Polygon(new_coords)
+    if not orthogonalized_geom.is_empty and orthogonalized_geom.is_valid:
+        bounds = orthogonalized_geom.bounds
+        mbr_area = (bounds[2] - bounds[0]) * (bounds[3] - bounds[1])
+        # A chamfered rectangle has area ~90% of its MBR. L-shapes are < 75%.
+        if mbr_area > 0 and (orthogonalized_geom.area / mbr_area) > 0.82:
+            new_coords = [
+                (bounds[0], bounds[1]),
+                (bounds[2], bounds[1]),
+                (bounds[2], bounds[3]),
+                (bounds[0], bounds[3]),
+                (bounds[0], bounds[1])
+            ]
 
     # E. Rotate back
     final_coords = [rotate_point(x, y, cx, cy, angle) for x, y in new_coords]
@@ -803,7 +856,12 @@ def regularize_polygons(
             except Exception:
                 pass
         
-        new_geoms.append(orthogonalize_polygon(geom, angle_tolerance, simplify_tolerance, strict_straight=strict_straight))
+        new_geoms.append(orthogonalize_polygon(
+            geom, 
+            angle_tolerance_deg=angle_tolerance, 
+            simplify_tol=simplify_tolerance, 
+            strict_straight=strict_straight
+        ))
 
     if src is not None:
         src.close()
@@ -1017,6 +1075,7 @@ def run_postprocess_pipeline(
     greenness_threshold: float = 15.0,
     enable_regularization: bool = True,
     angle_tolerance: float = 15.0,
+    simplify_tolerance: float = 0.75,
     log_callback: Optional[Callable[[str], None]] = None,
     progress_callback: Optional[Callable[[int, str], None]] = None,
 ) -> "geopandas.GeoDataFrame":
@@ -1075,6 +1134,7 @@ def run_postprocess_pipeline(
             greenness_threshold=greenness_threshold,
             enable=True, 
             angle_tolerance=angle_tolerance, 
+            simplify_tolerance=simplify_tolerance,
             log_callback=log
         )
 

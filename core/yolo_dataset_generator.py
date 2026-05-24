@@ -20,6 +20,7 @@ def generate_yolo_dataset(
     output_dir: str,
     chip_size: int = 640,
     target_gsd: float = 0.15,
+    target_class_name: str = "bangunan",
     log_callback: Optional[Callable[[str], None]] = None,
     progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> bool:
@@ -32,12 +33,12 @@ def generate_yolo_dataset(
 
     try:
         log("🎬 Memulai ekstraksi dataset YOLO (RT-Memory)...")
-        progress(5, "Membaca Shapefile bangunan...")
+        progress(5, f"Membaca Shapefile {target_class_name}...")
 
         # 1. Load building shapefile
         gdf = gpd.read_file(shp_path)
         if len(gdf) == 0:
-            log("❌ Error: Shapefile bangunan tidak berisi poligon apapun!")
+            log(f"❌ Error: Shapefile {target_class_name} tidak berisi poligon apapun!")
             return False
 
         # 2. Open GeoTIFF
@@ -84,7 +85,7 @@ def generate_yolo_dataset(
                 "path": os.path.abspath(output_dir),
                 "train": "images/train",
                 "val": "images/train",
-                "names": {0: "building"}
+                "names": {0: target_class_name}
             }
             with open(yaml_path, "w") as f:
                 yaml.dump(dataset_yaml, f, default_flow_style=False)
@@ -97,7 +98,7 @@ def generate_yolo_dataset(
 
             chip_count = 0
             total_buildings = len(gdf)
-            log(f"🏠 Total objek bangunan: {total_buildings:,}")
+            log(f"🎯 Total objek {target_class_name}: {total_buildings:,}")
 
             for idx, geom in enumerate(gdf.geometry):
                 if geom is None or not geom.is_valid:

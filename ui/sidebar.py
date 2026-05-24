@@ -32,14 +32,17 @@ class Sidebar(ctk.CTkScrollableFrame):
 
     TILE_OPTIONS = ["512", "1024", "2048"]
 
-    def __init__(self, parent, on_run: Callable, on_stop: Callable, on_train: Callable, on_train_yolo: Callable, **kwargs):
+    def __init__(self, parent, on_run: Callable, on_stop: Callable, on_train: Callable, on_train_yolo: Callable, on_wms_ready: Optional[Callable] = None, on_yolo_toggle: Optional[Callable] = None, **kwargs):
         super().__init__(parent, **kwargs)
         self.on_run = on_run
         self.on_stop = on_stop
         self.on_train = on_train
         self.on_train_yolo = on_train_yolo
+        self.on_wms_ready = on_wms_ready
+        self.on_yolo_toggle = on_yolo_toggle
         self._input_path = tk.StringVar()
         self._output_dir = tk.StringVar(value=str(os.path.join(os.getcwd(), "output")))
+        self._input_mode = tk.StringVar(value="📁 File Lokal")  # or "🌐 WMS Online"
         self._build_ui()
 
     def _section_label(self, text: str, row: int):
@@ -83,7 +86,7 @@ class Sidebar(ctk.CTkScrollableFrame):
 
         ctk.CTkLabel(
             title_frame,
-            text="Digitasi Bangunan Otomatis",
+            text="Digitasi Geospasial Otomatis",
             font=ctk.CTkFont(family="Segoe UI", size=10),
             text_color="#475569",
         ).grid(row=2, column=0, pady=(0, 12))
@@ -92,6 +95,23 @@ class Sidebar(ctk.CTkScrollableFrame):
 
         # ── 1. Input File ──────────────────────────────
         self._section_label("📂  FILE INPUT", row); row += 1
+
+        # Input mode toggle: File Lokal vs WMS Online
+        self.input_mode_seg = ctk.CTkSegmentedButton(
+            self,
+            values=["📁 File Lokal", "🌐 WMS Online"],
+            variable=self._input_mode,
+            font=ctk.CTkFont(size=11), height=30,
+            fg_color="#1E293B",
+            selected_color="#6366F1",
+            selected_hover_color="#4F46E5",
+            unselected_color="#1E293B",
+            unselected_hover_color="#334155",
+            text_color="#E2E8F0",
+            command=self._on_input_mode_changed,
+        )
+        self.input_mode_seg.grid(row=row, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 6))
+        row += 1
 
         self.lbl_input = ctk.CTkLabel(
             self,
@@ -105,7 +125,8 @@ class Sidebar(ctk.CTkScrollableFrame):
         self.lbl_input.grid(row=row, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 4))
         row += 1
 
-        ctk.CTkButton(
+        # Button: Pilih File (local mode)
+        self.btn_browse_file = ctk.CTkButton(
             self,
             text="📂  Pilih File ECW / TIF",
             font=ctk.CTkFont(size=12, weight="bold"),
@@ -114,7 +135,23 @@ class Sidebar(ctk.CTkScrollableFrame):
             fg_color="#6366F1",
             hover_color="#4F46E5",
             command=self._browse_input,
-        ).grid(row=row, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 4))
+        )
+        self.btn_browse_file.grid(row=row, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 4))
+
+        # Button: Buka Panel WMS (online mode, hidden by default)
+        self.btn_open_wms = ctk.CTkButton(
+            self,
+            text="🌐  Buka Panel WMS",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            height=38,
+            corner_radius=8,
+            fg_color="#0EA5E9",
+            hover_color="#0284C7",
+            command=self._open_wms_panel,
+        )
+        # Hidden initially, shown only in WMS mode
+        self.btn_open_wms.grid(row=row, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 4))
+        self.btn_open_wms.grid_remove()
         row += 1
 
         # Raster info display
@@ -226,10 +263,25 @@ class Sidebar(ctk.CTkScrollableFrame):
             font=ctk.CTkFont(size=11), text_color="#CBD5E1", anchor="w",
         ).grid(row=row, column=0, sticky="w", padx=12, pady=(4, 0))
 
-        self.yolo_var = tk.StringVar(value="yolov8n.pt (Nano - Cepat)")
+        # Dynamically find custom YOLO models in the models directory
+        models_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
+        custom_yolo_models = []
+        if os.path.exists(models_dir):
+            for f in os.listdir(models_dir):
+                if f.startswith("yolo_") and f.endswith(".pt"):
+                    custom_yolo_models.append(f"{f} (Custom)")
+                    
+        yolo_values = [
+            "yolo12n.pt (YOLO12 Nano - Terbaru)",
+            "yolo12s.pt (YOLO12 Small - Akurat)",
+            "yolov8n.pt (YOLOv8 Nano - Klasik)", 
+            "yolov8s.pt (YOLOv8 Small - Seimbang)", 
+        ] + custom_yolo_models
+
+        self.yolo_var = tk.StringVar(value="yolo12n.pt (YOLO12 Nano - Terbaru)")
         self.yolo_menu = ctk.CTkOptionMenu(
             self,
-            values=["yolov8n.pt (Nano - Cepat)", "yolov8s.pt (Small - Seimbang)", "yolo_bangunan_lokal.pt (Custom)"],
+            values=yolo_values,
             variable=self.yolo_var,
             font=ctk.CTkFont(size=11),
             height=28,
@@ -248,6 +300,7 @@ class Sidebar(ctk.CTkScrollableFrame):
             self, text="Tampilkan Preview Bounding Box (YOLO)",
             variable=self.show_yolo_preview_var,
             font=ctk.CTkFont(size=11), text_color="#E2E8F0",
+            command=self._on_yolo_switch,
         )
         self.switch_yolo_preview.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(8, 4))
         row += 1
@@ -394,7 +447,239 @@ class Sidebar(ctk.CTkScrollableFrame):
         ).grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0))
         row += 1
 
-        # ── 6. Action Buttons ──────────────────────────
+        # Toleransi Simplifikasi
+        ctk.CTkLabel(
+            self, text="Simplifikasi Garis (m):",
+            font=ctk.CTkFont(size=11), text_color="#CBD5E1", anchor="w",
+        ).grid(row=row, column=0, sticky="w", padx=12, pady=(4, 0))
+
+        self.simplify_var = ctk.CTkEntry(
+            self, placeholder_text="0.75", width=80, height=24,
+            font=ctk.CTkFont(size=11),
+            fg_color="#1E293B", border_color="#334155", text_color="#E2E8F0",
+        )
+        self.simplify_var.grid(row=row, column=1, sticky="ew", padx=(4, 12), pady=(4, 0))
+        self.simplify_var.insert(0, "0.75")
+        row += 1
+
+        # ── 5b. Objek Digitasi ─────────────────────────────
+        row += 1; self._divider(row); row += 1
+        self._section_label("🗺️  OBJEK DIGITASI", row); row += 1
+
+        info_lbl = ctk.CTkLabel(
+            self,
+            text="Pilih objek yang akan didigitasi oleh sistem:",
+            font=ctk.CTkFont(size=10),
+            text_color="#64748B",
+            anchor="w",
+            wraplength=200,
+            justify="left",
+        )
+        info_lbl.grid(row=row, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 6))
+        row += 1
+
+        # Checkbox: Bangunan (default ON) — mode ikuti Mode Digitasi utama
+        self.obj_building_var = tk.BooleanVar(value=True)
+        self.chk_building = ctk.CTkCheckBox(
+            self,
+            text="🏠  Bangunan",
+            variable=self.obj_building_var,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#00D4FF",
+            checkmark_color="#0F172A",
+            fg_color="#00D4FF",
+            hover_color="#00B8D9",
+            border_color="#334155",
+            height=26,
+        )
+        self.chk_building.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(2, 0))
+        row += 1
+
+        # Label mode bangunan (ikuti dropdown Mode Digitasi di atas)
+        ctk.CTkLabel(
+            self, text="   Mode: ikuti pilihan Mode Digitasi",
+            font=ctk.CTkFont(size=9), text_color="#475569", anchor="w",
+        ).grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 4))
+        row += 1
+
+        # ── Jalan & Infrastruktur ────────────────────────────────
+        self.obj_road_var = tk.BooleanVar(value=False)
+        self.chk_road = ctk.CTkCheckBox(
+            self,
+            text="🛣️  Jalan & Infrastruktur",
+            variable=self.obj_road_var,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#FF6B35",
+            checkmark_color="#0F172A",
+            fg_color="#FF6B35",
+            hover_color="#E55A25",
+            border_color="#334155",
+            height=26,
+        )
+        self.chk_road.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(6, 0))
+        row += 1
+
+        ctk.CTkLabel(
+            self, text="   Mode:",
+            font=ctk.CTkFont(size=10), text_color="#64748B", anchor="w",
+        ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(0, 4))
+
+        self.road_mode_var = tk.StringVar(value="Pra-Deteksi (YOLO Bounding Box)")
+        ctk.CTkOptionMenu(
+            self,
+            values=["SegFormer (Rekomendasi)", "Pra-Deteksi Warna", "Pra-Deteksi (YOLO Bounding Box)", "Otomatis SAM (Grid)"],
+            variable=self.road_mode_var,
+            font=ctk.CTkFont(size=10),
+            height=24,
+            fg_color="#1E293B",
+            button_color="#334155",
+            button_hover_color="#475569",
+            dropdown_fg_color="#1E293B",
+            dropdown_hover_color="#334155",
+            text_color="#CBD5E1",
+        ).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(0, 4))
+        row += 1
+
+        ctk.CTkLabel(
+            self, text="   Model YOLO:",
+            font=ctk.CTkFont(size=10), text_color="#64748B", anchor="w",
+        ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(0, 4))
+
+        self.road_yolo_var = tk.StringVar(value="yolo_jalan_lokal.pt (Custom)" if "yolo_jalan_lokal.pt (Custom)" in yolo_values else yolo_values[0])
+        ctk.CTkOptionMenu(
+            self,
+            values=yolo_values,
+            variable=self.road_yolo_var,
+            font=ctk.CTkFont(size=10),
+            height=24,
+            fg_color="#1E293B",
+            button_color="#334155",
+            button_hover_color="#475569",
+            dropdown_fg_color="#1E293B",
+            dropdown_hover_color="#334155",
+            text_color="#CBD5E1",
+        ).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(0, 4))
+        row += 1
+
+        # ── Badan Air ───────────────────────────────────────────
+        self.obj_water_var = tk.BooleanVar(value=False)
+        self.chk_water = ctk.CTkCheckBox(
+            self,
+            text="💧  Badan Air",
+            variable=self.obj_water_var,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#3B82F6",
+            checkmark_color="#0F172A",
+            fg_color="#3B82F6",
+            hover_color="#2563EB",
+            border_color="#334155",
+            height=26,
+        )
+        self.chk_water.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(6, 0))
+        row += 1
+
+        ctk.CTkLabel(
+            self, text="   Mode:",
+            font=ctk.CTkFont(size=10), text_color="#64748B", anchor="w",
+        ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(0, 4))
+
+        self.water_mode_var = tk.StringVar(value="SegFormer (Rekomendasi)")
+        ctk.CTkOptionMenu(
+            self,
+            values=["SegFormer (Rekomendasi)", "Pra-Deteksi Warna", "Pra-Deteksi (YOLO Bounding Box)", "Otomatis SAM (Grid)"],
+            variable=self.water_mode_var,
+            font=ctk.CTkFont(size=10),
+            height=24,
+            fg_color="#1E293B",
+            button_color="#334155",
+            button_hover_color="#475569",
+            dropdown_fg_color="#1E293B",
+            dropdown_hover_color="#334155",
+            text_color="#CBD5E1",
+        ).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(0, 4))
+        row += 1
+
+        ctk.CTkLabel(
+            self, text="   Model YOLO:",
+            font=ctk.CTkFont(size=10), text_color="#64748B", anchor="w",
+        ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(0, 4))
+
+        self.water_yolo_var = tk.StringVar(value=yolo_values[0])
+        ctk.CTkOptionMenu(
+            self,
+            values=yolo_values,
+            variable=self.water_yolo_var,
+            font=ctk.CTkFont(size=10),
+            height=24,
+            fg_color="#1E293B",
+            button_color="#334155",
+            button_hover_color="#475569",
+            dropdown_fg_color="#1E293B",
+            dropdown_hover_color="#334155",
+            text_color="#CBD5E1",
+        ).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(0, 4))
+        row += 1
+
+        # ── Vegetasi ─────────────────────────────────────────────
+        self.obj_veg_var = tk.BooleanVar(value=False)
+        self.chk_veg = ctk.CTkCheckBox(
+            self,
+            text="🌿  Vegetasi",
+            variable=self.obj_veg_var,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#22C55E",
+            checkmark_color="#0F172A",
+            fg_color="#22C55E",
+            hover_color="#16A34A",
+            border_color="#334155",
+            height=26,
+        )
+        self.chk_veg.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(6, 0))
+        row += 1
+
+        ctk.CTkLabel(
+            self, text="   Mode:",
+            font=ctk.CTkFont(size=10), text_color="#64748B", anchor="w",
+        ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(0, 4))
+
+        self.veg_mode_var = tk.StringVar(value="SegFormer (Rekomendasi)")
+        ctk.CTkOptionMenu(
+            self,
+            values=["SegFormer (Rekomendasi)", "Pra-Deteksi Warna", "Pra-Deteksi (YOLO Bounding Box)", "Otomatis SAM (Grid)"],
+            variable=self.veg_mode_var,
+            font=ctk.CTkFont(size=10),
+            height=24,
+            fg_color="#1E293B",
+            button_color="#334155",
+            button_hover_color="#475569",
+            dropdown_fg_color="#1E293B",
+            dropdown_hover_color="#334155",
+            text_color="#CBD5E1",
+        ).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(0, 6))
+        row += 1
+
+        ctk.CTkLabel(
+            self, text="   Model YOLO:",
+            font=ctk.CTkFont(size=10), text_color="#64748B", anchor="w",
+        ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(0, 6))
+
+        self.veg_yolo_var = tk.StringVar(value=yolo_values[0])
+        ctk.CTkOptionMenu(
+            self,
+            values=yolo_values,
+            variable=self.veg_yolo_var,
+            font=ctk.CTkFont(size=10),
+            height=24,
+            fg_color="#1E293B",
+            button_color="#334155",
+            button_hover_color="#475569",
+            dropdown_fg_color="#1E293B",
+            dropdown_hover_color="#334155",
+            text_color="#CBD5E1",
+        ).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(0, 6))
+        row += 1
+
+        # ── 6. Action Buttons ──────────────────────────────
         row += 1; self._divider(row); row += 1
 
         self.btn_run = ctk.CTkButton(
@@ -535,9 +820,9 @@ class Sidebar(ctk.CTkScrollableFrame):
         self.train_progress.set(0)
         row += 1
 
-        # ── 6c. Training Model YOLOv8 ──────────────────
+        # ── 6c. Training Model YOLO ──────────────────
         row += 1; self._divider(row); row += 1
-        self._section_label("🎯  TRAINING MODEL YOLOv8", row); row += 1
+        self._section_label("🎯  TRAINING MODEL YOLO", row); row += 1
         
         self.lbl_train_yolo_geotiff = ctk.CTkLabel(
             self,
@@ -607,6 +892,33 @@ class Sidebar(ctk.CTkScrollableFrame):
         self.btn_browse_train_yolo_shp.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=(0, 4))
         row += 1
         
+        self.lbl_train_yolo_target = ctk.CTkLabel(
+            self,
+            text="3. Target Objek:",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#CBD5E1",
+            anchor="w",
+        )
+        self.lbl_train_yolo_target.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0))
+        row += 1
+
+        self.train_yolo_target_var = tk.StringVar(value="Bangunan")
+        self.train_yolo_target_menu = ctk.CTkOptionMenu(
+            self,
+            values=["Bangunan", "Jalan", "Badan Air"],
+            variable=self.train_yolo_target_var,
+            font=ctk.CTkFont(size=11),
+            height=30,
+            fg_color="#0F172A",
+            button_color="#334155",
+            button_hover_color="#475569",
+            dropdown_fg_color="#1E293B",
+            dropdown_hover_color="#334155",
+            text_color="#E2E8F0",
+        )
+        self.train_yolo_target_menu.grid(row=row, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 10))
+        row += 1
+        
         self.btn_train_yolo_run = ctk.CTkButton(
             self,
             text="🎯  MULAI TRAINING YOLO",
@@ -652,6 +964,60 @@ class Sidebar(ctk.CTkScrollableFrame):
             text_color="#1E293B",
             justify="center",
         ).grid(row=row, column=0, columnspan=2, pady=(8, 4))
+
+    def _on_input_mode_changed(self, value: str):
+        """Toggle between local file and WMS online input modes."""
+        if value == "🌐 WMS Online":
+            self.btn_browse_file.grid_remove()
+            self.btn_open_wms.grid()
+            self.lbl_input.configure(
+                text="Pilih sumber WMS dan gambar area AOI",
+                text_color="#0EA5E9",
+            )
+            for key in self.info_labels:
+                self.info_labels[key].configure(text="—")
+        else:
+            self.btn_open_wms.grid_remove()
+            self.btn_browse_file.grid()
+            if not self._input_path.get():
+                self.lbl_input.configure(
+                    text="Belum ada file dipilih",
+                    text_color="#64748B",
+                )
+
+    def _open_wms_panel(self):
+        """Open the WMS panel dialog."""
+        from ui.wms_panel import WmsPanel
+        output_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp")
+        os.makedirs(output_dir, exist_ok=True)
+
+        panel = WmsPanel(
+            parent=self.winfo_toplevel(),
+            output_dir=output_dir,
+            on_ready_callback=self._on_wms_geotiff_ready,
+            log_callback=None,  # Will be set by app.py if needed
+        )
+
+    def _on_wms_geotiff_ready(self, geotiff_path: str):
+        """Called when WMS AOI download is complete."""
+        self._input_path.set(geotiff_path)
+        display_name = os.path.basename(geotiff_path)
+        self.lbl_input.configure(
+            text=f"🌐 {display_name}",
+            text_color="#0EA5E9",
+        )
+        self._load_raster_info(geotiff_path)
+        if self.on_wms_ready:
+            self.on_wms_ready(geotiff_path)
+
+    def _on_yolo_switch(self):
+        """Called when YOLO preview toggle is clicked."""
+        if getattr(self, "on_yolo_toggle", None):
+            self.on_yolo_toggle(self.show_yolo_preview_var.get())
+
+    def set_wms_geotiff(self, geotiff_path: str):
+        """Programmatically set the WMS-downloaded GeoTIFF as input."""
+        self._on_wms_geotiff_ready(geotiff_path)
 
     def _browse_input(self):
         path = filedialog.askopenfilename(
@@ -726,6 +1092,10 @@ class Sidebar(ctk.CTkScrollableFrame):
             max_area = float(self.max_area_var.get())
         except ValueError:
             max_area = 100000.0
+        try:
+            simplify_tol = float(self.simplify_var.get())
+        except Exception:
+            simplify_tol = 0.75
 
         # Parse points_per_side from selection string
         pts_str = self.pts_var.get()
@@ -750,6 +1120,25 @@ class Sidebar(ctk.CTkScrollableFrame):
             "enable_shadow_filter": self.shadow_var.get(),
             "enable_vegetation_filter": self.vegetation_var.get(),
             "enable_regularization": self.regularize_var.get(),
+            "simplify_tolerance": simplify_tol,
+            # ── Objek Digitasi ──────────────────────────────────
+            "enabled_objects": {
+                "building":   self.obj_building_var.get(),
+                "road":       self.obj_road_var.get(),
+                "water":      self.obj_water_var.get(),
+                "vegetation": self.obj_veg_var.get(),
+            },
+            # ── Mode per objek non-bangunan ────────────────────────
+            "object_modes": {
+                "road":       self.road_mode_var.get(),
+                "water":      self.water_mode_var.get(),
+                "vegetation": self.veg_mode_var.get(),
+            },
+            "object_yolo_models": {
+                "road":       self.road_yolo_var.get(),
+                "water":      self.water_yolo_var.get(),
+                "vegetation": self.veg_yolo_var.get(),
+            },
         }
 
     def _browse_train_geotiff(self):
@@ -849,8 +1238,9 @@ class Sidebar(ctk.CTkScrollableFrame):
             messagebox.showerror("File Tidak Ditemukan", f"Shapefile tidak ditemukan di path:\n{shp}")
             return
             
+        target_obj = self.train_yolo_target_var.get().strip()
         self.btn_train_yolo_run.configure(state="disabled", text="⏳  Training YOLO...")
-        self.on_train_yolo(geotiff, shp)
+        self.on_train_yolo(geotiff, shp, target_obj)
 
     def set_training_yolo_progress(self, percent: float, status_msg: str):
         """Update progress bar and status text for YOLO training."""

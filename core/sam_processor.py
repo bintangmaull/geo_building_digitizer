@@ -422,11 +422,12 @@ class SAMProcessor:
         point_coords: Optional[List[List[int]]] = None,
         point_labels: Optional[List[int]] = None,
         box_prompts: Optional[List[List[int]]] = None,
+        global_indices: Optional[List[int]] = None,
     ) -> bool:
         """
-        Run SAM automatic or prompt-based segmentation on a single tile.
-        In prompt mode, segments each point individually to avoid merging buildings.
-        Returns True if successful, False if cancelled.
+        Run SAM prediction on a single tile.
+        If box_prompts are provided, it predicts using boxes.
+        If global_indices is provided, it assigns those values to the instance mask pixels.
         """
         if self.is_cancelled():
             return False
@@ -454,7 +455,20 @@ class SAMProcessor:
                 temp_point_path = os.path.join(temp_dir, f"temp_predict_{os.path.basename(tile_path)}")
                 
                 # Loop through each prompt separately to prevent SAM from merging them
-                items_to_loop = box_prompts if self.mode == "yolo" else list(zip(point_coords, point_labels))
+                if self.mode == "yolo" and box_prompts:
+                    # Sort Smallest First! This ensures small buildings claim their pixels
+                    # instead of being swallowed by the SAM bleed of larger neighboring buildings.
+                    if global_indices is None:
+                        global_indices = list(range(1, len(box_prompts) + 1))
+                        
+                    items_to_loop = sorted(
+                        zip(box_prompts, global_indices),
+                        key=lambda x: (x[0][2] - x[0][0]) * (x[0][3] - x[0][1]),
+                        reverse=False
+                    )
+                else:
+                    items_to_loop = list(zip(point_coords, point_labels)) if point_coords else []
+                
                 
                 for idx, item in enumerate(items_to_loop):
                     if self.is_cancelled():
@@ -466,27 +480,38 @@ class SAMProcessor:
                             
                         # Predict single building
                         if self.mode == "yolo":
+                            box_coord, g_idx = item
                             self._sam.predict(
-                                boxes=item,
-                                output=temp_point_path,
+                                boxes=box_coord,
+                                output=temp_point_path
                             )
                         else:
-                            coord, label = item
                             self._sam.predict(
-                                point_coords=[coord],
-                                point_labels=[label],
-                                output=temp_point_path,
+                                point_coords=item[0],
+                                point_labels=item[1],
+                                output=temp_point_path
                             )
                         
                         # Read individual binary mask
                         if os.path.exists(temp_point_path):
-                            with rasterio.open(temp_point_path) as p_src:
-                                point_mask = p_src.read(1)
+                            with rasterio.open(temp_point_path) as temp_src:
+                                point_mask = temp_src.read(1)
+                                if self.mode == "yolo":
+                                    # Crop point_mask strictly to its YOLO bounding box
+                                    # This prevents SAM from bleeding into neighboring buildings!
+                                    bx1, by1, bx2, by2 = [int(round(c)) for c in box_coord]
+                                    bx1, by1 = max(0, bx1), max(0, by1)
+                                    bx2, by2 = min(w, bx2), min(h, by2)
+                                    cropped_mask = np.zeros_like(point_mask)
+                                    cropped_mask[by1:by2, bx1:bx2] = point_mask[by1:by2, bx1:bx2]
+                                    point_mask = cropped_mask
+
                                 # Assign a unique ID to this building's pixels to keep them separate in vectorization
-                                building_id = idx + 1
-                                master_mask = np.where(point_mask > 0, building_id, master_mask)
+                                building_id = g_idx if self.mode == "yolo" else (idx + 1)
+                                # Overwrite where master_mask is empty (0)
+                                master_mask = np.where((point_mask > 0) & (master_mask == 0), building_id, master_mask)
                     except Exception as pe:
-                        self._log(f"      ⚠️ Gagal segmentasi item {item}: {pe}", "warning")
+                        self._log(f"      ⚠️ Gagal segmentasi item {item}: {pe}")
                 
                 # Cleanup temp file
                 if os.path.exists(temp_point_path):
@@ -549,6 +574,13 @@ class SAMProcessor:
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         tiles_temp_dir = os.path.join(project_root, "temp", "tiles")
 
+        # ── FASE 1: Deteksi YOLO / Pra-pemrosesan di Semua Tile ──
+        self._log("Fase 1: Mengeksekusi Pra-pemrosesan (YOLO) pada semua tile...")
+        all_yolo_detections = []
+        tiles_data = []
+
+        # We need to compute total tiles upfront to show progress properly if needed,
+        # but tiles_generator yields them.
         for tile_path, tile_meta, idx, total in tiles_generator(
             raster_path=raster_path,
             tile_size=tile_size,
@@ -558,50 +590,65 @@ class SAMProcessor:
         ):
             if self.is_cancelled():
                 self._log("Proses dibatalkan oleh pengguna.")
-                break
+                return results, global_yolo_boxes
 
-            tile_name = Path(tile_path).stem
-            mask_path = os.path.join(masks_dir, f"mask_{tile_name}.tif")
-
-            self._log(f"[{idx+1}/{total}] Memproses tile: {tile_name}")
-            if tile_progress_callback:
-                tile_progress_callback(idx + 1, total)
-
-            # Selalu proses ulang — hapus mask lama agar parameter baru berlaku
-            if os.path.isfile(mask_path):
-                os.remove(mask_path)
-
-            point_coords, point_labels = None, None
-            box_prompts = None
+            import rasterio
+            with rasterio.open(tile_path) as src:
+                tile_meta = src.meta.copy()
+                w, h = src.width, src.height
+                transform = src.transform
+                
+            x0, y0 = transform * (0, 0)
+            x1, y1 = transform * (w, h)
+            minx, maxx = min(x0, x1), max(x0, x1)
+            miny, maxy = min(y0, y1), max(y0, y1)
             
+            tile_dict = {
+                "tile_path": tile_path,
+                "tile_meta": tile_meta,
+                "bbox": [minx, miny, maxx, maxy],
+                "idx": idx,
+                "total": total,
+                "point_coords": None,
+                "point_labels": None,
+                "box_prompts": None
+            }
+
+            self._log(f"[{idx+1}/{total}] Fase 1 - Pra-pemrosesan: {Path(tile_path).stem}")
+            if tile_progress_callback:
+                # Provide progress for phase 1
+                tile_progress_callback(idx + 1, total * 2)
+
             if self.mode == "yolo" and self._yolo:
                 import cv2
                 img = cv2.imread(tile_path)
-                # Run YOLO inference with parameters optimized for dense small objects
                 yolo_results = self._yolo(
                     img, 
                     verbose=False,
-                    imgsz=max(img.shape[0], img.shape[1]), # Prevent downscaling to 640
-                    conf=0.15,                             # Lower confidence for small buildings
-                    iou=0.45,                              # Standard NMS threshold
-                    max_det=3000                           # Increase max detections from default 300
+                    imgsz=max(img.shape[0], img.shape[1]),
+                    conf=0.15,
+                    iou=0.45,
+                    max_det=3000
                 )
-                boxes = yolo_results[0].boxes.xyxy.cpu().numpy() # [x1, y1, x2, y2]
+                boxes = yolo_results[0].boxes.xyxy.cpu().numpy()
+                confidences = yolo_results[0].boxes.conf.cpu().numpy()
+                
                 if len(boxes) > 0:
-                    box_prompts = boxes.tolist()
-                    self._log(f"  -> YOLO menemukan {len(box_prompts)} bangunan")
-                    # Convert to global coordinates for preview
+                    self._log(f"  -> YOLO menemukan {len(boxes)} bangunan")
                     transform = tile_meta["transform"]
-                    for box in box_prompts:
+                    tile_idx = len(tiles_data)
+                    for box, conf in zip(boxes, confidences):
                         x1, y1, x2, y2 = box
                         geo_x1, geo_y1 = transform * (x1, y1)
                         geo_x2, geo_y2 = transform * (x2, y2)
-                        global_yolo_boxes.append([min(geo_x1,geo_x2), min(geo_y1,geo_y2), max(geo_x1,geo_x2), max(geo_y1,geo_y2)])
-                else:
-                    self._log("  -> Dilewati (YOLO tidak menemukan bangunan)")
-                    continue
+                        global_box = [min(geo_x1,geo_x2), min(geo_y1,geo_y2), max(geo_x1,geo_x2), max(geo_y1,geo_y2)]
+                        all_yolo_detections.append({
+                            "global_box": global_box,
+                            "conf": float(conf),
+                            "local_box": box.tolist(),
+                            "tile_idx": tile_idx
+                        })
             elif self.mode == "prompt":
-                # Compute resolution from tile metadata transform
                 transform = tile_meta["transform"]
                 res_x = abs(transform.a)
                 res_y = abs(transform.e)
@@ -613,22 +660,155 @@ class SAMProcessor:
                 point_coords, point_labels = self.detect_building_points(
                     tile_path, min_area_px, max_area_px
                 )
-                self._log(f"  -> Pra-deteksi menemukan {len(point_coords)} calon bangunan")
-                if not point_coords:
-                    self._log("  -> Dilewati (tidak ada bangunan terdeteksi)")
-                    continue
+                tile_dict["point_coords"] = point_coords
+                tile_dict["point_labels"] = point_labels
+                
+            tiles_data.append(tile_dict)
 
+        # ── FASE 2: Global NMS (Khusus YOLO) ──
+        if self.mode == "yolo" and self._yolo:
+            if len(all_yolo_detections) > 0:
+                self._log(f"Fase 2: Menjalankan Global NMS pada {len(all_yolo_detections)} kotak awal...")
+                try:
+                    import torch
+                    import torchvision
+                    
+                    boxes_tensor = torch.tensor([d["global_box"] for d in all_yolo_detections], dtype=torch.float32)
+                    scores_tensor = torch.tensor([d["conf"] for d in all_yolo_detections], dtype=torch.float32)
+                    
+                    # 1. Standard NMS
+                    keep_indices = torchvision.ops.nms(boxes_tensor, scores_tensor, 0.3).tolist()
+                    
+                    # 2. IoM NMS (Intersection over Minimum Area)
+                    # We want to keep the most confident predictions.
+                    # Sort by CONFIDENCE (Highest First).
+                    final_keep = []
+                    kept_dets = [all_yolo_detections[i] for i in keep_indices]
+                    kept_dets.sort(
+                        key=lambda d: d["conf"], 
+                        reverse=True
+                    )
+                    
+                    for det in kept_dets:
+                        boxA = det["global_box"]
+                        areaA = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+                        keep = True
+                        for f_det in final_keep:
+                            boxB = f_det["global_box"]
+                            areaB = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+                            
+                            ix1 = max(boxA[0], boxB[0])
+                            iy1 = max(boxA[1], boxB[1])
+                            ix2 = min(boxA[2], boxB[2])
+                            iy2 = min(boxA[3], boxB[3])
+                            
+                            w = max(0, ix2 - ix1)
+                            h = max(0, iy2 - iy1)
+                            inter = w * h
+                            
+                            min_area = min(areaA, areaB)
+                            if min_area > 0 and (inter / min_area) > 0.60:
+                                keep = False
+                                break
+                                
+                        if keep:
+                            final_keep.append(det)
+                            
+                    self._log(f"  -> Global NMS selesai. Tersisa BB unik: {len(final_keep)}")
+                    
+                    for global_idx, det in enumerate(final_keep):
+                        box = det["global_box"]
+                        global_yolo_boxes.append(box)
+                        
+                        # Distribusikan kotak global ke SEMUA tile yang berpotongan
+                        for t_idx, t_data in enumerate(tiles_data):
+                            t_box = t_data["bbox"]  # [minx, miny, maxx, maxy]
+                            # Cek intersection
+                            if not (box[2] < t_box[0] or box[0] > t_box[2] or box[3] < t_box[1] or box[1] > t_box[3]):
+                                # Convert global box ke local tile pixels
+                                t_transform = tiles_data[t_idx]["tile_meta"]["transform"]
+                                inv_transform = ~t_transform
+                                px1, py1 = inv_transform * (box[0], box[1])
+                                px2, py2 = inv_transform * (box[2], box[3])
+                                local_x1 = float(min(px1, px2))
+                                local_y1 = float(min(py1, py2))
+                                local_x2 = float(max(px1, px2))
+                                local_y2 = float(max(py1, py2))
+                                
+                                if tiles_data[t_idx].get("box_prompts") is None:
+                                    tiles_data[t_idx]["box_prompts"] = []
+                                    tiles_data[t_idx]["global_indices"] = []
+                                tiles_data[t_idx]["box_prompts"].append([local_x1, local_y1, local_x2, local_y2])
+                                tiles_data[t_idx]["global_indices"].append(global_idx + 1) # Use 1-based index for mask
+
+                except ImportError:
+                    self._log("⚠️ PyTorch tidak tersedia untuk NMS. Menggunakan semua deteksi YOLO.")
+                    for global_idx, det in enumerate(all_yolo_detections):
+                        box = det["global_box"]
+                        global_yolo_boxes.append(box)
+                        for t_idx, t_data in enumerate(tiles_data):
+                            t_box = t_data["bbox"]
+                            if not (box[2] < t_box[0] or box[0] > t_box[2] or box[3] < t_box[1] or box[1] > t_box[3]):
+                                t_transform = tiles_data[t_idx]["tile_meta"]["transform"]
+                                inv_transform = ~t_transform
+                                px1, py1 = inv_transform * (box[0], box[1])
+                                px2, py2 = inv_transform * (box[2], box[3])
+                                local_x1 = float(min(px1, px2))
+                                local_y1 = float(min(py1, py2))
+                                local_x2 = float(max(px1, px2))
+                                local_y2 = float(max(py1, py2))
+                                if tiles_data[t_idx].get("box_prompts") is None:
+                                    tiles_data[t_idx]["box_prompts"] = []
+                                    tiles_data[t_idx]["global_indices"] = []
+                                tiles_data[t_idx]["box_prompts"].append([local_x1, local_y1, local_x2, local_y2])
+                                tiles_data[t_idx]["global_indices"].append(global_idx + 1)
+
+        # ── FASE 3: SAM Segmentasi ──
+        total_tiles = len(tiles_data)
+        self._log(f"Fase 3: Mengeksekusi SAM pada {total_tiles} tile...")
+        
+        for tile_idx, t_data in enumerate(tiles_data):
+            if self.is_cancelled():
+                self._log("Proses dibatalkan oleh pengguna.")
+                break
+                
+            tile_path = t_data["tile_path"]
+            tile_meta = t_data["tile_meta"]
+            idx = t_data["idx"]
+            total = t_data["total"]
+            
+            self._log(f"[{idx+1}/{total}] Fase 3 - SAM Segmentasi: {Path(tile_path).stem}")
+            if tile_progress_callback:
+                tile_progress_callback(total + idx + 1, total * 2)
+                
+            if self.mode == "yolo":
+                if t_data["box_prompts"] is None or len(t_data["box_prompts"]) == 0:
+                    self._log("  -> Dilewati (Tidak ada objek unik tersisa)")
+                    continue
+                else:
+                    self._log(f"  -> SAM mengeksekusi {len(t_data['box_prompts'])} Bounding Box unik...")
+            elif self.mode == "prompt":
+                if not t_data["point_coords"]:
+                    self._log("  -> Dilewati (Tidak ada calon bangunan)")
+                    continue
+                    
+            tile_name = Path(tile_path).stem
+            mask_path = os.path.join(masks_dir, f"mask_{tile_name}.tif")
+            
+            if os.path.isfile(mask_path):
+                os.remove(mask_path)
+                
             success = self.process_tile(
                 tile_path, mask_path,
-                point_coords=point_coords,
-                point_labels=point_labels,
-                box_prompts=box_prompts
+                point_coords=t_data["point_coords"],
+                point_labels=t_data["point_labels"],
+                box_prompts=t_data["box_prompts"],
+                global_indices=t_data.get("global_indices")
             )
+            
             if success and os.path.isfile(mask_path):
                 results.append((mask_path, tile_meta))
                 self._log(f"  -> Berhasil: {Path(mask_path).name}")
-            else:
-                self._log(f"  -> Gagal atau dibatalkan")
 
         # Free GPU memory
         if self.device == "cuda":

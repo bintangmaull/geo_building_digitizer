@@ -41,8 +41,8 @@ from ui.log_panel import LogPanel
 class SAMGeoApp(ctk.CTk):
     """Main application window."""
 
-    APP_TITLE = "SAM-Geo Building Digitizer"
-    APP_VERSION = "1.2"
+    APP_TITLE = "SAM-Geo Multi-Object Digitizer"
+    APP_VERSION = "1.3"
     MIN_WIDTH = 1200
     MIN_HEIGHT = 720
 
@@ -83,6 +83,8 @@ class SAMGeoApp(ctk.CTk):
             on_stop=self._on_stop,
             on_train=self._on_train,
             on_train_yolo=self._on_train_yolo,
+            on_wms_ready=self._on_wms_ready,
+            on_yolo_toggle=self._on_yolo_toggle,
             width=240,
             fg_color="#0A1628",
             corner_radius=0,
@@ -160,7 +162,7 @@ class SAMGeoApp(ctk.CTk):
 
     def _check_environment(self):
         """Verify required packages and GPU availability at startup."""
-        self.log_panel.log("=== SAM-Geo Building Digitizer v1.2 ===", "system")
+        self.log_panel.log("=== SAM-Geo Multi-Object Digitizer v1.3 ===", "system")
         self.log_panel.log("Memeriksa environment...", "system")
 
         missing = []
@@ -232,6 +234,16 @@ class SAMGeoApp(ctk.CTk):
         else:
             self.log_panel.log("\n✅ Semua library siap! Pilih file raster untuk memulai.", "success")
 
+    def _on_wms_ready(self, geotiff_path: str):
+        """Called when WMS AOI download completes — preview the result GeoTIFF."""
+        self.log_panel.log(f"🌐 Citra WMS siap: {geotiff_path}", "success")
+        self.preview.load_raster_preview(geotiff_path)
+
+    def _on_yolo_toggle(self, show: bool):
+        """Called when YOLO preview toggle is clicked in the sidebar."""
+        if hasattr(self, "preview") and self.preview:
+            self.preview.toggle_yolo_boxes(show)
+
     def _log(self, message: str, level: str = "info"):
         """Thread-safe log callback."""
         self.after(0, lambda: self.log_panel.log(message, level))
@@ -246,16 +258,39 @@ class SAMGeoApp(ctk.CTk):
         self.after(0, lambda: self.preview.set_active_tile(current - 1))
 
     def _on_run(self, params: dict):
-        """Called when user clicks Run. Starts processing in background thread."""
+        """Called when user clicks Run.
+        Routes to building-only pipeline OR multi-object pipeline depending on selection.
+        """
         if self._processing_thread and self._processing_thread.is_alive():
+            return
+
+        # Validasi: minimal satu objek harus dipilih
+        enabled = params.get("enabled_objects", {"building": True})
+        if not any(enabled.values()):
+            from tkinter import messagebox
+            messagebox.showwarning(
+                "Tidak Ada Objek Dipilih",
+                "Pilih minimal satu objek digitasi\n(Bangunan, Jalan, Badan Air, atau Vegetasi)."
+            )
             return
 
         self.log_panel.reset()
         self.preview.clear_results()
         self._result_gdf = None
 
+        # Tentukan pipeline yang tepat
+        only_building = enabled.get("building", False) and \
+                        not any(v for k, v in enabled.items() if k != "building")
+
+        if only_building:
+            # Gunakan pipeline bangunan yang sudah ada (tidak diubah)
+            target = self._run_pipeline
+        else:
+            # Gunakan pipeline multi-objek
+            target = self._run_multi_object_pipeline
+
         self._processing_thread = threading.Thread(
-            target=self._run_pipeline,
+            target=target,
             args=(params,),
             daemon=True,
         )
@@ -335,14 +370,14 @@ class SAMGeoApp(ctk.CTk):
             self._log(traceback.format_exc(), "error")
             self.after(0, lambda: self.sidebar.set_training_idle("Error fatal training!", False))
 
-    def _on_train_yolo(self, geotiff_path: str, shp_path: str):
+    def _on_train_yolo(self, geotiff_path: str, shp_path: str, target_obj: str = "Bangunan"):
         """Starts the YOLO AI model training process in a background thread."""
         self.log_panel.reset()
-        self._log("=== MEMULAI PROSES TRAINING YOLOv8 ===", "system")
+        self._log("=== MEMULAI PROSES TRAINING YOLO ===", "system")
         
         train_yolo_thread = threading.Thread(
             target=self._run_training_yolo_pipeline,
-            args=(geotiff_path, shp_path),
+            args=(geotiff_path, shp_path, target_obj),
             daemon=True,
         )
         train_yolo_thread.start()
@@ -353,23 +388,26 @@ class SAMGeoApp(ctk.CTk):
         if message:
             self._log(f"⚡ [YOLO Progress] {message}", "info")
 
-    def _run_training_yolo_pipeline(self, geotiff_path: str, shp_path: str):
+    def _run_training_yolo_pipeline(self, geotiff_path: str, shp_path: str, target_obj: str = "Bangunan"):
         """Runs YOLO dataset generation and training in background."""
         import shutil
         from core.yolo_dataset_generator import generate_yolo_dataset
         from train_yolo import train_yolo_model
 
         dataset_dir = os.path.join(ROOT, "dataset_yolo")
+        target_obj_lower = target_obj.lower().replace("badan ", "").replace(" ", "_")
+        output_model_name = f"yolo_{target_obj_lower}_lokal.pt"
         
         try:
             # 1. Dataset Generation
-            self._train_yolo_progress(0, "Mempersiapkan dataset YOLO...")
+            self._train_yolo_progress(0, f"Mempersiapkan dataset YOLO untuk {target_obj}...")
             success = generate_yolo_dataset(
                 geotiff_path=geotiff_path,
                 shp_path=shp_path,
                 output_dir=dataset_dir,
                 chip_size=640,
                 target_gsd=0.15,
+                target_class_name=target_obj_lower,
                 log_callback=self._log,
                 progress_callback=self._train_yolo_progress,
             )
@@ -389,24 +427,25 @@ class SAMGeoApp(ctk.CTk):
                     base_model = custom_model_path
                     self._log(f"🔄 Melanjutkan training (fine-tuning) dari model kustom YOLO yang sudah ada: {custom_model_path}", "system")
                 else:
-                    base_model = "yolov8n.pt"
+                    base_model = "yolo12n.pt"
                     self._log(f"⚠️ Model kustom tidak ditemukan, memulai training baru dengan base model: {base_model}", "warning")
 
             success = train_yolo_model(
                 dataset_dir=dataset_dir,
-                epochs=25, # YOLO usually needs a bit more epochs
+                epochs=100, # YOLO usually needs a bit more epochs
                 batch_size=4,
                 base_model=base_model,
+                output_model_name=output_model_name,
                 log_callback=self._log,
                 progress_callback=self._train_yolo_progress,
             )
 
             if success:
                 self._log("🎉 TRAINING YOLO SELESAI DENGAN SUKSES!", "success")
-                self._log("💾 Model disimpan di: models/yolo_bangunan_lokal.pt", "success")
+                self._log(f"💾 Model disimpan di: models/{output_model_name}", "success")
                 self.after(0, lambda: self.sidebar.set_training_yolo_idle("Latihan sukses! Model siap.", True))
                 # Update sidebar var to select the new custom model automatically
-                self.after(0, lambda: self.sidebar.yolo_var.set("yolo_bangunan_lokal.pt (Custom)"))
+                self.after(0, lambda: self.sidebar.yolo_var.set(f"{output_model_name} (Custom)"))
             else:
                 self._log("❌ Proses training YOLO gagal.", "error")
                 self.after(0, lambda: self.sidebar.set_training_yolo_idle("Training YOLO gagal!", False))
@@ -514,7 +553,7 @@ class SAMGeoApp(ctk.CTk):
                 device="auto",
                 points_per_side=params.get("points_per_side", 48),
                 mode=params.get("mode", "Otomatis (Grid Buta)"),
-                yolo_model_name=params.get("yolo_model", "yolov8n.pt (Nano - Cepat)"),
+                yolo_model_name=params.get("yolo_model", "yolo12n.pt (YOLO12 Nano - Terbaru)"),
                 log_callback=self._log,
                 progress_callback=self._progress,
             )
@@ -570,11 +609,13 @@ class SAMGeoApp(ctk.CTk):
                 enable_shadow_filter=params["enable_shadow_filter"],
                 enable_vegetation_filter=params.get("enable_vegetation_filter", True),
                 enable_regularization=params["enable_regularization"],
+                simplify_tolerance=params.get("simplify_tolerance", 0.75),
                 log_callback=self._log,
                 progress_callback=self._progress,
             )
 
             self._result_gdf = result_gdf
+            self._last_building_gdf = result_gdf  # Untuk priority clipping multi-objek
 
             if len(result_gdf) == 0:
                 self._log("⚠️ Tidak ada bangunan yang terdeteksi. Coba turunkan nilai min area.", "warning")
@@ -641,6 +682,178 @@ class SAMGeoApp(ctk.CTk):
                     pass
                 self._processor = None
             # Re-enable buttons
+            self.after(0, self.sidebar.set_idle)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PIPELINE MULTI-OBJEK (Jalan, Air, Vegetasi, dan/atau Bangunan)
+    # Metode ini berdiri sendiri dan TIDAK mengubah _run_pipeline() di atas.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _run_multi_object_pipeline(self, params: dict):
+        """
+        Pipeline multi-objek: jalankan digitasi untuk semua kelas terpilih.
+        Jika bangunan juga dipilih, pipeline bangunan dijalankan terpisah TERLEBIH DAHULU
+        (menggunakan _run_pipeline yang sudah ada), lalu objek lain menyusul.
+        Semua hasil non-bangunan digabung ke satu shapefile gabungan dengan kolom 'class'.
+        """
+        input_path    = params["input_path"]
+        output_dir    = params["output_dir"]
+        model_name    = params["model_name"]
+        tile_size     = params["tile_size"]
+        enabled       = params.get("enabled_objects", {"building": False})
+
+        import shutil
+        temp_dir  = os.path.join(ROOT, "temp")
+        masks_dir = os.path.join(temp_dir, "masks")
+        tiles_dir = os.path.join(temp_dir, "tiles")
+
+        self._log("🧹 Membersihkan cache dan file temporary lama...", "system")
+        if os.path.exists(masks_dir):
+            shutil.rmtree(masks_dir, ignore_errors=True)
+        if os.path.exists(tiles_dir):
+            shutil.rmtree(tiles_dir, ignore_errors=True)
+
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(masks_dir, exist_ok=True)
+        os.makedirs(tiles_dir, exist_ok=True)
+
+        try:
+            # ── STEP 1: Handle ECW → GeoTIFF
+            self._progress(5, "Memeriksa format file input...")
+            ext = Path(input_path).suffix.lower()
+            if ext == ".ecw":
+                self._log("📥 File ECW terdeteksi, memulai konversi ke GeoTIFF...", "system")
+                from core.ecw_handler import find_gdal_translate, convert_ecw_to_geotiff
+                gdal_path = find_gdal_translate()
+                if not gdal_path:
+                    raise RuntimeError("GDAL tidak ditemukan. File ECW tidak dapat dikonversi.")
+                raster_path = convert_ecw_to_geotiff(
+                    input_path, temp_dir, gdal_path, progress_callback=self._progress
+                )
+                self._log(f"✅ Konversi selesai: {Path(raster_path).name}", "success")
+            else:
+                raster_path = input_path
+                self._progress(10, "File GeoTIFF siap diproses")
+                self._log(f"📥 File GeoTIFF: {Path(raster_path).name}", "system")
+
+            # ── STEP 2: Preview raster
+            self._progress(12, "Memuat preview citra...")
+            self.after(0, lambda: self.preview.load_raster_preview(raster_path))
+
+            input_stem = Path(input_path).stem
+
+            # ── STEP 3: Bangunan (jika diaktifkan) — gunakan pipeline bangunan yang ada
+            if enabled.get("building", False):
+                self._log("\n🏠 Memulai digitasi BANGUNAN...", "system")
+                self._progress(15, "Memulai digitasi bangunan...")
+
+                # Buat parameter khusus untuk pipeline bangunan (tanpa multi-object routing)
+                building_params = dict(params)
+                building_params["enabled_objects"] = {"building": True}  # Paksa hanya bangunan
+
+                # Panggil _run_pipeline langsung (blocking di thread ini sudah aman)
+                self._run_pipeline(building_params)
+                # _run_pipeline sudah memanggil set_idle di akhir, perlu di-override
+                # Kita set kembali tombol ke loading state untuk objek berikutnya
+                self.after(0, lambda: self.sidebar.btn_run.configure(
+                    state="disabled", text="⏳  Memproses objek lain..."
+                ))
+
+            # ── STEP 4: Objek non-bangunan
+            non_building_active = {k: v for k, v in enabled.items() if k != "building" and v}
+            if non_building_active:
+                self._progress(50, "Memulai digitasi multi-objek...")
+
+                from core.multi_object_runner import (
+                    run_multi_object_digitization,
+                    export_combined_shapefile,
+                    get_multi_object_summary,
+                )
+
+                combined_gdf = run_multi_object_digitization(
+                    raster_path=raster_path,
+                    output_dir=output_dir,
+                    input_stem=input_stem,
+                    sam_model_name=model_name,
+                    tile_size=tile_size,
+                    enabled_objects=enabled,
+                    params=params,
+                    masks_base_dir=masks_dir,
+                    building_gdf=getattr(self, "_last_building_gdf", None),
+                    log_callback=self._log,
+                    progress_callback=self._progress,
+                    cancel_check=lambda: (self._processor.is_cancelled()
+                                         if self._processor else False),
+                )
+
+                if combined_gdf is not None and len(combined_gdf) > 0:
+                    # Tampilkan di preview dengan warna per kelas
+                    self.after(0, lambda gdf=combined_gdf:
+                               self.preview.set_multi_object_polygons(gdf))
+
+                    # Ekspor ke Shapefile gabungan
+                    self._progress(92, "Mengekspor ke Shapefile gabungan...")
+                    output_shp = os.path.join(output_dir, f"{input_stem}_digitasi.shp")
+                    export_combined_shapefile(
+                        combined_gdf,
+                        output_shp,
+                        source_raster_path=raster_path,
+                        log_callback=self._log,
+                    )
+
+                    summary = get_multi_object_summary(output_shp)
+                    self._progress(100, f"✅ Selesai! {summary.get('total', len(combined_gdf))} poligon diekspor")
+
+                    # Susun pesan ringkasan per kelas
+                    by_class = summary.get("by_class", {})
+                    class_lines = "\n".join(
+                        f"   - {cls}: {info['count']:,} poligon "
+                        f"({info.get('total_area_m2', 0):,.1f} m²)"
+                        for cls, info in by_class.items()
+                    )
+
+                    self._log(
+                        f"\n{'='*50}\n"
+                        f"✅ DIGITASI MULTI-OBJEK SELESAI\n"
+                        f"{class_lines}\n"
+                        f"   Total: {summary.get('total', len(combined_gdf)):,} poligon\n"
+                        f"   Output: {output_shp}\n"
+                        f"   Ukuran file: {summary.get('file_size_kb', 0):,} KB\n"
+                        f"{'='*50}",
+                        "success"
+                    )
+
+                    rincian_lines = "\n".join(
+                        f"  {cls}: {info['count']:,}"
+                        for cls, info in by_class.items()
+                    )
+                    self.after(0, lambda msg_body=(
+                        f"✅ {summary.get('total', len(combined_gdf)):,} poligon berhasil didigitasi!\n\n"
+                        f"Rincian:\n{rincian_lines}\n\n"
+                        f"File output:\n{output_shp}\n\n"
+                        f"Buka file .shp di QGIS atau ArcGIS."
+                    ): messagebox.showinfo("Digitasi Selesai", msg_body))
+
+                else:
+                    if not enabled.get("building", False):
+                        self._log("⚠️ Tidak ada objek yang terdeteksi.", "warning")
+                        self._progress(0, "Tidak ada hasil")
+
+        except Exception as e:
+            err_msg = f"❌ ERROR: {e}\n{traceback.format_exc()}"
+            self._log(err_msg, "error")
+            self._progress(0, "Error — lihat log")
+            self.after(0, lambda msg=str(e): messagebox.showerror(
+                "Error", f"Terjadi kesalahan:\n\n{msg}\n\nLihat log untuk detail."
+            ))
+
+        finally:
+            if self._processor:
+                try:
+                    self._processor.unload_model()
+                except Exception:
+                    pass
+                self._processor = None
             self.after(0, self.sidebar.set_idle)
 
     def _on_close(self):
