@@ -45,13 +45,32 @@ def train_yolo_model(
                     
                 # A safer monkey-patch: replace parse_model entirely for this run!
                 import inspect
-                source = inspect.getsource(original_parse_model)
+                try:
+                    source = inspect.getsource(original_parse_model)
+                except OSError:
+                    # Fallback jika getsource gagal (misal file .pyc atau environment Windows)
+                    import ast
+                    tasks_file = inspect.getfile(tasks)
+                    with open(tasks_file, "r", encoding="utf-8") as f:
+                        tasks_code = f.read()
+                    parsed = ast.parse(tasks_code)
+                    for node in parsed.body:
+                        if isinstance(node, ast.FunctionDef) and node.name == 'parse_model':
+                            source = ast.unparse(node)
+                            break
+                    else:
+                        raise ValueError("parse_model not found in tasks.py")
+
                 # Sisipkan PConv dan SKNet ke dalam set base_modules di kode sumbernya!
-                source = source.replace('base_modules = frozenset(', 'base_modules = frozenset({PConv, SKNet} | ')
-                source = source.replace(')\n    repeat_modules', ')\n    repeat_modules')
+                if 'base_modules = frozenset({' in source:
+                    source = source.replace('base_modules = frozenset({', 'base_modules = frozenset({PConv, SKNet, ')
+                elif 'base_modules = frozenset(' in source:
+                    source = source.replace('base_modules = frozenset(', 'base_modules = frozenset({PConv, SKNet} | ')
                 
                 # Execute the modified source
                 exec_globals = tasks.__dict__.copy()
+                exec_globals['PConv'] = PConv
+                exec_globals['SKNet'] = SKNet
                 exec(source, exec_globals)
                 tasks.parse_model = exec_globals['parse_model']
                 

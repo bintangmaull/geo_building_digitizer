@@ -428,8 +428,13 @@ class SAMGeoApp(ctk.CTk):
             base_model = self.sidebar.yolo_var.get().split()[0]
             
             if target_obj_lower == "jalan":
-                base_model = os.path.join(ROOT, "core", "models", "uav-yolov12-seg.yaml")
-                self._log("🛣️ Menggunakan arsitektur kustom UAV-YOLO12-Seg untuk jalan", "system")
+                custom_model_path = os.path.join(ROOT, "models", output_model_name)
+                if os.path.exists(custom_model_path):
+                    base_model = custom_model_path
+                    self._log(f"🔄 Melanjutkan training (fine-tuning) dari model kustom UAV-YOLO12-Seg yang sudah ada: {custom_model_path}", "system")
+                else:
+                    base_model = os.path.join(ROOT, "core", "models", "uav-yolov12-seg.yaml")
+                    self._log("🛣️ Menggunakan arsitektur kustom UAV-YOLO12-Seg untuk jalan", "system")
             elif base_model == "yolo_bangunan_lokal.pt":
                 custom_model_path = os.path.join(ROOT, "models", "yolo_bangunan_lokal.pt")
                 if os.path.exists(custom_model_path):

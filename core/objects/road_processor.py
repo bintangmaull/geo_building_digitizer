@@ -169,14 +169,19 @@ class RoadProcessor:
 
         prob_binary = prob_map >= threshold
 
-        # Vegetasi mask
         R = img_norm[:, :, 0].astype(float)
         G = img_norm[:, :, 1].astype(float)
         B = img_norm[:, :, 2].astype(float) if img_norm.shape[2] >= 3 else np.zeros_like(R)
         exg = 2.0 * G - R - B
         veg_mask = exg > 15.0
 
-        binary = prob_binary & ~veg_mask
+        if getattr(self, 'mode', 'mahalanobis') == 'yolo':
+            # YOLO mendeteksi jalan di bawah pohon (jika dilatih). Jangan hapus secara paksa.
+            # Kita gunakan veg_mask nanti sebagai syarat "Smart Bridge".
+            binary = prob_binary
+        else:
+            binary = prob_binary & ~veg_mask
+            
         return binary.astype(np.uint8) * 255
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -191,6 +196,7 @@ class RoadProcessor:
         min_area_px: int   = _MIN_BLOB_AREA_PX,
         min_elongation: float = 2.5,
         max_solidity: float   = 0.85,
+        veg_mask: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         1. Morphological closing
@@ -204,6 +210,21 @@ class RoadProcessor:
             cv2.MORPH_ELLIPSE, (close_radius * 2 + 1, close_radius * 2 + 1)
         )
         closed = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel)
+        
+        # [SMART BRIDGE] Hanya pertahankan jembatan jika area tersebut adalah pohon
+        if veg_mask is not None:
+            added = (closed > 0) & (binary_mask == 0)
+            n_labels, labels = cv2.connectedComponents(added.astype(np.uint8))
+            valid_closed = binary_mask.copy()
+            for lbl in range(1, n_labels):
+                bridge_mask = (labels == lbl)
+                bridge_area = bridge_mask.sum()
+                if bridge_area == 0: continue
+                # Jika lebih dari 15% area jembatan adalah pohon, anggap valid
+                overlap = (bridge_mask & veg_mask).sum() / bridge_area
+                if overlap > 0.15:
+                    valid_closed[bridge_mask] = 255
+            closed = valid_closed
 
         n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
         cleaned = np.zeros_like(closed)
@@ -800,11 +821,21 @@ class RoadProcessor:
                     continue
 
                 # ── Fase 7: Morphology [FIX 4] ────────────────────────────────
+                # Deteksi pohon khusus untuk tile ini (sebagai syarat Smart Bridge)
+                R_tile = img_norm[:, :, 0].astype(float)
+                G_tile = img_norm[:, :, 1].astype(float)
+                B_tile = img_norm[:, :, 2].astype(float) if img_norm.shape[2] >= 3 else np.zeros_like(R_tile)
+                tile_veg_mask = (2.0 * G_tile - R_tile - B_tile) > 15.0
+
                 # YOLO memprediksi per-segmen kotak, kadang ada celah kecil antar segmen.
                 # Kita perbesar radius closing untuk menyambung celah tersebut.
                 # Radius 80 piksel akan menyambung celah hingga ~160 piksel (~20 meter di dunia nyata)
-                close_rad = 80 if getattr(self, 'mode', 'mahalanobis') == 'yolo' else _MORPH_CLOSE_RADIUS
-                cleaned_mask = self._morphology(binary_mask, close_radius=close_rad)
+                is_yolo = getattr(self, 'mode', 'mahalanobis') == 'yolo'
+                close_rad = 80 if is_yolo else _MORPH_CLOSE_RADIUS
+                
+                # Gunakan Smart Bridge (lewat veg_mask) hanya untuk YOLO agar aman
+                pass_veg = tile_veg_mask if is_yolo else None
+                cleaned_mask = self._morphology(binary_mask, close_radius=close_rad, veg_mask=pass_veg)
 
                 # ── Fase 7b: Proximity Filter [FIX 2] ────────────────────────
                 cleaned_mask = self._filter_by_proximity_to_buildings(
