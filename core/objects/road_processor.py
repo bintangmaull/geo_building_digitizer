@@ -140,8 +140,33 @@ class RoadProcessor:
         return prob.reshape(H, W).astype(np.float32)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # FASE 6: MASKING
+    # FASE A & C: ROAD SPACE & MASKING
     # ══════════════════════════════════════════════════════════════════════════
+
+    def _estimate_road_space(
+        self,
+        building_mask: np.ndarray,
+        pixel_size_m: float,
+        dilate_m: float = 6.0,
+    ) -> np.ndarray:
+        """
+        [FASE A] Dilate polygon bangunan → gap antar bangunan = kandidat area jalan.
+        """
+        import cv2
+        if building_mask is None:
+            return None
+            
+        dilate_px = max(1, int(dilate_m / pixel_size_m))
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1)
+        )
+        
+        building_uint8 = building_mask.astype(np.uint8)
+        dilated = cv2.dilate(building_uint8, kernel).astype(bool)
+        
+        # Gap = area yang diliputi dilasi tapi BUKAN bangunan asli
+        road_space = dilated & ~building_mask.astype(bool)
+        return road_space
 
     def _apply_mask(
         self,
@@ -149,29 +174,34 @@ class RoadProcessor:
         img_norm: np.ndarray,
         threshold: float = 0.45,
         building_mask: Optional[np.ndarray] = None,
+        road_space: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Buat binary road mask dari probability map.
         [FIX 1] Subtract building mask lebih awal (jika ada).
-        Eksklusikan:
-          - Piksel dengan probabilitas rendah (< threshold)
-          - Piksel vegetasi (ExG tinggi)
+        [FASE C] Gabungkan probabilitas jalan dengan road_space, dikurangi vegetasi.
         """
         if building_mask is not None:
             prob_map[building_mask == 1] = 0.0
 
         # Threshold probability
-        binary = (prob_map >= threshold).astype(np.uint8) * 255
+        prob_binary = (prob_map >= threshold)
 
         # Exclude vegetasi (ExG tinggi)
         R = img_norm[:, :, 0].astype(float)
         G = img_norm[:, :, 1].astype(float)
         B = img_norm[:, :, 2].astype(float) if img_norm.shape[2] >= 3 else np.zeros_like(R)
         exg = 2.0 * G - R - B
-        veg_mask = (exg > 15).astype(np.uint8)
-        binary[veg_mask == 1] = 0
+        veg_mask = (exg > 15)
 
-        return binary
+        # [FASE C] Combine
+        # Jika pixel memiliki skor Mahalanobis tinggi ATAU berada di gap antar bangunan
+        if road_space is not None:
+            binary = (prob_binary | road_space) & ~veg_mask
+        else:
+            binary = prob_binary & ~veg_mask
+
+        return binary.astype(np.uint8) * 255
 
     # ══════════════════════════════════════════════════════════════════════════
     # FASE 7: MORPHOLOGY
@@ -752,6 +782,7 @@ class RoadProcessor:
 
                 # [FIX 1] Rasterize building_gdf for this tile
                 building_mask_arr = None
+                road_space = None
                 if building_gdf is not None and len(building_gdf) > 0:
                     from rasterio.features import geometry_mask
                     shapes = [geom for geom in building_gdf.geometry if geom is not None]
@@ -762,12 +793,17 @@ class RoadProcessor:
                             invert=True,  # True inside buildings
                             out_shape=(img_raw.shape[0], img_raw.shape[1])
                         )
+                        # [FASE A] Road Space Estimation
+                        road_space = self._estimate_road_space(
+                            building_mask_arr, pixel_size_m, dilate_m=6.0
+                        )
                     except Exception as e:
-                        self._log(f"  ⚠ Gagal rasterize building mask: {e}")
+                        self._log(f"  ⚠ Gagal memproses building mask: {e}")
 
-                # Fase 6: Masking
+                # [FASE C] Masking & Combine
                 binary_mask = self._apply_mask(
-                    prob_map, img_norm, threshold=prob_threshold, building_mask=building_mask_arr
+                    prob_map, img_norm, threshold=prob_threshold, 
+                    building_mask=building_mask_arr, road_space=road_space
                 )
 
                 road_px_count = (binary_mask > 0).sum()
