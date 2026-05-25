@@ -12,7 +12,13 @@ Modul:
 """
 
 from .road_processor import RoadProcessor
+from .road_fingerprint import RoadFingerprintBuilder
 from .water_processor import WaterProcessor
 from .vegetation_processor import VegetationProcessor
 
-__all__ = ["RoadProcessor", "WaterProcessor", "VegetationProcessor"]
+__all__ = [
+    "RoadProcessor",
+    "RoadFingerprintBuilder",
+    "WaterProcessor",
+    "VegetationProcessor",
+]

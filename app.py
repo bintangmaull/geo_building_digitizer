@@ -85,6 +85,7 @@ class SAMGeoApp(ctk.CTk):
             on_train_yolo=self._on_train_yolo,
             on_wms_ready=self._on_wms_ready,
             on_yolo_toggle=self._on_yolo_toggle,
+            on_build_fingerprint=self._on_build_fingerprint,
             width=240,
             fg_color="#0A1628",
             corner_radius=0,
@@ -454,6 +455,49 @@ class SAMGeoApp(ctk.CTk):
             self._log(f"❌ Error selama training YOLO: {e}", "error")
             self._log(traceback.format_exc(), "error")
             self.after(0, lambda: self.sidebar.set_training_yolo_idle("Error fatal training YOLO!", False))
+
+    def _on_build_fingerprint(self, ref_raster: str, ref_shp: str, output_path: str):
+        """Starts the Road Fingerprint builder in a background thread."""
+        self.log_panel.reset()
+        self._log("=== MEMBANGUN ROAD FINGERPRINT ===", "system")
+        self._log(f"Citra referensi: {ref_raster}")
+        self._log(f"Polygon referensi: {ref_shp}")
+        
+        thread = threading.Thread(
+            target=self._run_build_fingerprint,
+            args=(ref_raster, ref_shp, output_path),
+            daemon=True,
+        )
+        thread.start()
+
+    def _fp_progress(self, percent: float, message: str = ""):
+        """Thread-safe fingerprint progress callback."""
+        self.after(0, lambda: self.sidebar.set_fingerprint_progress(percent, message))
+        if message:
+            self._log(f"🔬 [Fingerprint] {message}", "info")
+
+    def _run_build_fingerprint(self, ref_raster: str, ref_shp: str, output_path: str):
+        from core.objects.road_fingerprint import RoadFingerprintBuilder
+        try:
+            builder = RoadFingerprintBuilder(
+                log_callback=self._log,
+                progress_callback=self._fp_progress,
+            )
+            result = builder.build(ref_raster, ref_shp, output_path)
+            
+            if result:
+                self._log("🎉 ROAD FINGERPRINT BERHASIL DIBUAT!", "success")
+                self._log(f"💾 Disimpan di: {output_path}", "success")
+                self.after(0, lambda: self.sidebar.set_fingerprint_idle(f"✅ Disimpan: {os.path.basename(output_path)}", True))
+                self.after(0, lambda: self.sidebar.road_fp_path_var.set(output_path))
+            else:
+                self._log("❌ Gagal membuat fingerprint (dibatalkan atau kosong).", "error")
+                self.after(0, lambda: self.sidebar.set_fingerprint_idle("Gagal membuat fingerprint!", False))
+                
+        except Exception as e:
+            self._log(f"❌ Error membuat fingerprint: {e}", "error")
+            self._log(traceback.format_exc(), "error")
+            self.after(0, lambda: self.sidebar.set_fingerprint_idle("Error fatal!", False))
 
     def _run_pipeline(self, params: dict):
         """

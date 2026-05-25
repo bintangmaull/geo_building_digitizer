@@ -423,21 +423,43 @@ def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr):
         pre_simplified = geom.simplify(angle_simplify_tol, preserve_topology=True)
         coords = list(pre_simplified.exterior.coords)
         buckets = {}
+        bounds = pre_simplified.bounds
         for i in range(len(coords) - 1):
-            dx = coords[i+1][0] - coords[i][0]
-            dy = coords[i+1][1] - coords[i][1]
+            p1 = coords[i]
+            p2 = coords[i+1]
+            dx = p2[0] - p1[0]
+            dy = p2[1] - p1[1]
             length = math.hypot(dx, dy)
             if length < angle_simplify_tol: continue # Ignore tiny artifact edges
             
             deg = math.degrees(math.atan2(dy, dx)) % 90.0
             
             # Penalize perfect H/V edges because they are highly likely to be artificial YOLO crop lines.
-            # True H/V buildings will still easily win since 100% of their edges are H/V.
             is_perfect_hv = abs(dx) < 1e-8 or abs(dy) < 1e-8
-            weight_multiplier = 0.5 if is_perfect_hv else 1.0
             
-            # Distribute length across adjacent bins (smoothing) to prevent noisy straight edges
-            # from splitting across multiple bins (e.g., 88, 89, 0, 1, 2) and losing to a single diagonal edge.
+            # HEAVY PENALTY for bounding box edges (these are 100% crop lines or image boundaries)
+            is_on_boundary = False
+            p1_left = abs(p1[0] - bounds[0]) < 1.0
+            p2_left = abs(p2[0] - bounds[0]) < 1.0
+            p1_right = abs(p1[0] - bounds[2]) < 1.0
+            p2_right = abs(p2[0] - bounds[2]) < 1.0
+            
+            p1_bottom = abs(p1[1] - bounds[1]) < 1.0
+            p2_bottom = abs(p2[1] - bounds[1]) < 1.0
+            p1_top = abs(p1[1] - bounds[3]) < 1.0
+            p2_top = abs(p2[1] - bounds[3]) < 1.0
+            
+            if (p1_left and p2_left) or (p1_right and p2_right) or \
+               (p1_bottom and p2_bottom) or (p1_top and p2_top):
+                is_on_boundary = True
+                
+            weight_multiplier = 1.0
+            if is_on_boundary:
+                weight_multiplier = 0.05
+            elif is_perfect_hv:
+                weight_multiplier = 0.5
+            
+            # Distribute length across adjacent bins (smoothing)
             for offset in range(-3, 4):
                 bin_idx = int(round(deg + offset)) % 90
                 # Give highest weight to the exact center, lower to the edges
@@ -452,7 +474,57 @@ def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr):
                     max_val = val
                     best_bin = b_idx
                     
-            hist_angle_deg = best_bin
+            # REFINE THE ANGLE to sub-degree precision
+            exact_angle_sum = 0.0
+            exact_weight_sum = 0.0
+            
+            for i in range(len(coords) - 1):
+                p1 = coords[i]
+                p2 = coords[i+1]
+                dx = p2[0] - p1[0]
+                dy = p2[1] - p1[1]
+                length = math.hypot(dx, dy)
+                if length < angle_simplify_tol: continue
+                
+                deg = math.degrees(math.atan2(dy, dx)) % 90.0
+                diff = abs(deg - best_bin)
+                if diff > 45:
+                    diff = 90 - diff
+                    
+                if diff <= 4.0:
+                    avg_deg = deg
+                    if best_bin < 10 and deg > 80:
+                        avg_deg = deg - 90
+                    elif best_bin > 80 and deg < 10:
+                        avg_deg = deg + 90
+                        
+                    is_perfect_hv = abs(dx) < 1e-8 or abs(dy) < 1e-8
+                    is_on_boundary = False
+                    p1_left = abs(p1[0] - bounds[0]) < 1.0
+                    p2_left = abs(p2[0] - bounds[0]) < 1.0
+                    p1_right = abs(p1[0] - bounds[2]) < 1.0
+                    p2_right = abs(p2[0] - bounds[2]) < 1.0
+                    p1_bottom = abs(p1[1] - bounds[1]) < 1.0
+                    p2_bottom = abs(p2[1] - bounds[1]) < 1.0
+                    p1_top = abs(p1[1] - bounds[3]) < 1.0
+                    p2_top = abs(p2[1] - bounds[3]) < 1.0
+                    if (p1_left and p2_left) or (p1_right and p2_right) or \
+                       (p1_bottom and p2_bottom) or (p1_top and p2_top):
+                        is_on_boundary = True
+                            
+                    wm = 1.0
+                    if is_on_boundary: wm = 0.05
+                    elif is_perfect_hv: wm = 0.5
+                    
+                    w = length * wm
+                    exact_angle_sum += avg_deg * w
+                    exact_weight_sum += w
+                    
+            if exact_weight_sum > 0:
+                hist_angle_deg = (exact_angle_sum / exact_weight_sum) % 90.0
+            else:
+                hist_angle_deg = best_bin
+
             angle = math.radians(hist_angle_deg)
         else:
             raise ValueError("No valid edges found")
@@ -502,7 +574,9 @@ def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr):
         # Geographic coordinates check
         is_strict = True
 
-    base_tol = actual_simplify_tol * 0.2 if is_strict else actual_simplify_tol
+    # Do NOT artificially shrink the tolerance. We want to smooth out small noise
+    # (like chimneys or minor SAM artifacts) so they don't turn into ugly zig-zags when forced orthogonal.
+    base_tol = actual_simplify_tol
     simplified = rotated_geom.simplify(base_tol, preserve_topology=True)
 
     # NEW: Axis-Aligned Mitre Closing for tree bites
@@ -973,6 +1047,69 @@ def filter_non_building_colors(
         return gdf
 
 
+def merge_overlapping_fragments(
+    gdf: "geopandas.GeoDataFrame",
+    threshold: float = 0.15,
+    log_callback=None,
+) -> "geopandas.GeoDataFrame":
+    """
+    Merge polygons that overlap significantly (e.g. YOLO duplicate detections for the same complex roof).
+    Adjacent distinct buildings (e.g. terraced houses) will not be merged because their intersection area is ~0.
+    """
+    import geopandas as gpd
+    from shapely.ops import unary_union
+
+    log = log_callback or (lambda x: None)
+    if len(gdf) <= 1:
+        return gdf
+
+    log("Menggabungkan fragmen bangunan yang tumpang tindih...")
+    geoms = list(gdf.geometry)
+
+    changed = True
+    while changed:
+        changed = False
+        new_geoms = []
+        skip_indices = set()
+
+        for i in range(len(geoms)):
+            if i in skip_indices: continue
+
+            g_i = geoms[i]
+            if not g_i.is_valid:
+                g_i = g_i.buffer(0)
+            
+            b1 = g_i.bounds
+
+            for j in range(i + 1, len(geoms)):
+                if j in skip_indices: continue
+                
+                g_j = geoms[j]
+                b2 = g_j.bounds
+                # Fast bounding box check
+                if b1[2] < b2[0] or b1[0] > b2[2] or b1[3] < b2[1] or b1[1] > b2[3]:
+                    continue
+
+                if not g_j.is_valid:
+                    g_j = g_j.buffer(0)
+
+                inter = g_i.intersection(g_j)
+                if not inter.is_empty:
+                    min_area = min(g_i.area, g_j.area)
+                    if min_area > 0 and (inter.area / min_area) > threshold:
+                        g_i = unary_union([g_i, g_j]).buffer(0)
+                        skip_indices.add(j)
+                        changed = True
+                        b1 = g_i.bounds # Update bounds after merge
+
+            new_geoms.append(g_i)
+
+        geoms = new_geoms
+
+    log(f"Fragmen digabung. Total poligon unik: {len(geoms)}")
+    return gpd.GeoDataFrame(geometry=geoms, crs=gdf.crs)
+
+
 def resolve_overlaps(
     gdf: "geopandas.GeoDataFrame",
     log_callback: Optional[Callable[[str], None]] = None,
@@ -1124,6 +1261,11 @@ def run_postprocess_pipeline(
     if enable_vegetation_filter:
         progress(88, "Mendeteksi dan menghapus vegetasi (pohon/halaman)...")
         gdf = filter_vegetation(gdf, original_raster_path, greenness_threshold, log_callback=log)
+
+    # 4c. Merge overlapping fragments (duplicate detections of the same building)
+    # MUST be done before regularization so the regularizer sees the full complex roof!
+    progress(90, "Menggabungkan fragmen bangunan yang tumpang tindih...")
+    gdf = merge_overlapping_fragments(gdf, threshold=0.15, log_callback=log)
 
     # 5. Regularization
     if enable_regularization:

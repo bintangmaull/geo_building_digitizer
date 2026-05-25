@@ -32,7 +32,7 @@ class Sidebar(ctk.CTkScrollableFrame):
 
     TILE_OPTIONS = ["512", "1024", "2048"]
 
-    def __init__(self, parent, on_run: Callable, on_stop: Callable, on_train: Callable, on_train_yolo: Callable, on_wms_ready: Optional[Callable] = None, on_yolo_toggle: Optional[Callable] = None, **kwargs):
+    def __init__(self, parent, on_run: Callable, on_stop: Callable, on_train: Callable, on_train_yolo: Callable, on_wms_ready: Optional[Callable] = None, on_yolo_toggle: Optional[Callable] = None, on_build_fingerprint: Optional[Callable] = None, **kwargs):
         super().__init__(parent, **kwargs)
         self.on_run = on_run
         self.on_stop = on_stop
@@ -40,6 +40,7 @@ class Sidebar(ctk.CTkScrollableFrame):
         self.on_train_yolo = on_train_yolo
         self.on_wms_ready = on_wms_ready
         self.on_yolo_toggle = on_yolo_toggle
+        self.on_build_fingerprint = on_build_fingerprint
         self._input_path = tk.StringVar()
         self._output_dir = tk.StringVar(value=str(os.path.join(os.getcwd(), "output")))
         self._input_mode = tk.StringVar(value="📁 File Lokal")  # or "🌐 WMS Online"
@@ -515,19 +516,21 @@ class Sidebar(ctk.CTkScrollableFrame):
             hover_color="#E55A25",
             border_color="#334155",
             height=26,
+            command=self._on_road_toggled,
         )
         self.chk_road.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(6, 0))
         row += 1
 
+        # Mode dropdown
         ctk.CTkLabel(
             self, text="   Mode:",
             font=ctk.CTkFont(size=10), text_color="#64748B", anchor="w",
-        ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(0, 4))
+        ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(0, 2))
 
-        self.road_mode_var = tk.StringVar(value="Pra-Deteksi (YOLO Bounding Box)")
-        ctk.CTkOptionMenu(
+        self.road_mode_var = tk.StringVar(value="Road Fingerprint (Adaptif)")
+        self._road_mode_menu = ctk.CTkOptionMenu(
             self,
-            values=["SegFormer (Rekomendasi)", "Pra-Deteksi Warna", "Pra-Deteksi (YOLO Bounding Box)", "Otomatis SAM (Grid)"],
+            values=["Road Fingerprint (Adaptif)", "Pra-Deteksi Warna (Lama)"],
             variable=self.road_mode_var,
             font=ctk.CTkFont(size=10),
             height=24,
@@ -537,29 +540,165 @@ class Sidebar(ctk.CTkScrollableFrame):
             dropdown_fg_color="#1E293B",
             dropdown_hover_color="#334155",
             text_color="#CBD5E1",
-        ).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(0, 4))
+            command=self._on_road_mode_changed,
+        )
+        self._road_mode_menu.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(0, 2))
         row += 1
+
+        # ── Sub-panel Road Fingerprint ───────────────────────────
+        self._road_fp_frame = ctk.CTkFrame(
+            self, fg_color="#0F172A", corner_radius=8
+        )
+        self._road_fp_frame.grid(
+            row=row, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 6)
+        )
+        self._road_fp_frame.grid_columnconfigure(0, weight=1)
+        row += 1
+
+        # Toggle: Buat Baru / Load Existing
+        self.road_fp_source_var = tk.StringVar(value="🔬 Buat Baru")
+        self._road_fp_seg = ctk.CTkSegmentedButton(
+            self._road_fp_frame,
+            values=["🔬 Buat Baru", "📂 Load Existing"],
+            variable=self.road_fp_source_var,
+            font=ctk.CTkFont(size=10),
+            height=26,
+            fg_color="#1E293B",
+            selected_color="#FF6B35",
+            selected_hover_color="#E55A25",
+            unselected_color="#1E293B",
+            unselected_hover_color="#334155",
+            text_color="#E2E8F0",
+            command=self._on_road_fp_source_changed,
+        )
+        self._road_fp_seg.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+
+        # ── Buat Baru — form ──────────────────────────────────────
+        self._road_build_frame = ctk.CTkFrame(
+            self._road_fp_frame, fg_color="transparent"
+        )
+        self._road_build_frame.grid(row=1, column=0, sticky="ew", padx=4, pady=2)
+        self._road_build_frame.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
-            self, text="   Model YOLO:",
-            font=ctk.CTkFont(size=10), text_color="#64748B", anchor="w",
-        ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(0, 4))
+            self._road_build_frame,
+            text="Citra Referensi (.tif / .ecw):",
+            font=ctk.CTkFont(size=9, weight="bold"),
+            text_color="#94A3B8", anchor="w",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=4, pady=(4, 0))
 
-        self.road_yolo_var = tk.StringVar(value="yolo_jalan_lokal.pt (Custom)" if "yolo_jalan_lokal.pt (Custom)" in yolo_values else yolo_values[0])
-        ctk.CTkOptionMenu(
-            self,
-            values=yolo_values,
-            variable=self.road_yolo_var,
+        self.road_ref_raster_var = tk.StringVar()
+        self._road_ref_raster_entry = ctk.CTkEntry(
+            self._road_build_frame,
+            textvariable=self.road_ref_raster_var,
+            placeholder_text="Path citra referensi ...",
             font=ctk.CTkFont(size=10),
-            height=24,
-            fg_color="#1E293B",
-            button_color="#334155",
-            button_hover_color="#475569",
-            dropdown_fg_color="#1E293B",
-            dropdown_hover_color="#334155",
-            text_color="#CBD5E1",
-        ).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=(0, 4))
-        row += 1
+            height=26,
+            fg_color="#0F172A",
+            border_color="#334155",
+            text_color="#E2E8F0",
+        )
+        self._road_ref_raster_entry.grid(row=1, column=0, sticky="ew", padx=(4, 2), pady=1)
+
+        ctk.CTkButton(
+            self._road_build_frame,
+            text="📂", width=30, height=26,
+            corner_radius=6, fg_color="#334155", hover_color="#475569",
+            command=self._browse_road_ref_raster,
+        ).grid(row=1, column=1, sticky="w", padx=(0, 4), pady=1)
+
+        ctk.CTkLabel(
+            self._road_build_frame,
+            text="Polygon Jalan Referensi (.shp):",
+            font=ctk.CTkFont(size=9, weight="bold"),
+            text_color="#94A3B8", anchor="w",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=4, pady=(4, 0))
+
+        self.road_ref_shp_var = tk.StringVar()
+        self._road_ref_shp_entry = ctk.CTkEntry(
+            self._road_build_frame,
+            textvariable=self.road_ref_shp_var,
+            placeholder_text="Path polygon jalan .shp ...",
+            font=ctk.CTkFont(size=10),
+            height=26,
+            fg_color="#0F172A",
+            border_color="#334155",
+            text_color="#E2E8F0",
+        )
+        self._road_ref_shp_entry.grid(row=3, column=0, sticky="ew", padx=(4, 2), pady=1)
+
+        ctk.CTkButton(
+            self._road_build_frame,
+            text="📂", width=30, height=26,
+            corner_radius=6, fg_color="#334155", hover_color="#475569",
+            command=self._browse_road_ref_shp,
+        ).grid(row=3, column=1, sticky="w", padx=(0, 4), pady=1)
+
+        self.btn_build_fingerprint = ctk.CTkButton(
+            self._road_build_frame,
+            text="🔬  BUAT FINGERPRINT",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            height=32, corner_radius=7,
+            fg_color="#FF6B35", hover_color="#E55A25",
+            text_color="#FFFFFF",
+            command=self._on_build_fingerprint_clicked,
+        )
+        self.btn_build_fingerprint.grid(
+            row=4, column=0, columnspan=2, sticky="ew", padx=4, pady=(6, 2)
+        )
+
+        self.lbl_fp_status = ctk.CTkLabel(
+            self._road_build_frame,
+            text="Status: Belum ada fingerprint",
+            font=ctk.CTkFont(size=9),
+            text_color="#64748B", anchor="w", wraplength=180,
+        )
+        self.lbl_fp_status.grid(row=5, column=0, columnspan=2, sticky="ew", padx=4, pady=(2, 0))
+
+        self.fp_progress = ctk.CTkProgressBar(
+            self._road_build_frame,
+            height=6, corner_radius=3,
+            fg_color="#1E293B", progress_color="#FF6B35",
+        )
+        self.fp_progress.grid(
+            row=6, column=0, columnspan=2, sticky="ew", padx=4, pady=(2, 6)
+        )
+        self.fp_progress.set(0)
+
+        # ── Load Existing — form ──────────────────────────────────
+        self._road_load_frame = ctk.CTkFrame(
+            self._road_fp_frame, fg_color="transparent"
+        )
+        self._road_load_frame.grid(row=2, column=0, sticky="ew", padx=4, pady=2)
+        self._road_load_frame.grid_columnconfigure(0, weight=1)
+        self._road_load_frame.grid_remove()   # Hidden by default
+
+        ctk.CTkLabel(
+            self._road_load_frame,
+            text="File Fingerprint (.json):",
+            font=ctk.CTkFont(size=9, weight="bold"),
+            text_color="#94A3B8", anchor="w",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=4, pady=(4, 0))
+
+        self.road_fp_path_var = tk.StringVar()
+        self._road_fp_path_entry = ctk.CTkEntry(
+            self._road_load_frame,
+            textvariable=self.road_fp_path_var,
+            placeholder_text="Path road_fingerprint.json ...",
+            font=ctk.CTkFont(size=10),
+            height=26,
+            fg_color="#0F172A",
+            border_color="#334155",
+            text_color="#E2E8F0",
+        )
+        self._road_fp_path_entry.grid(row=1, column=0, sticky="ew", padx=(4, 2), pady=(2, 6))
+
+        ctk.CTkButton(
+            self._road_load_frame,
+            text="📂", width=30, height=26,
+            corner_radius=6, fg_color="#334155", hover_color="#475569",
+            command=self._browse_road_fp_json,
+        ).grid(row=1, column=1, sticky="w", padx=(0, 4), pady=(2, 6))
 
         # ── Badan Air ───────────────────────────────────────────
         self.obj_water_var = tk.BooleanVar(value=False)
@@ -965,6 +1104,9 @@ class Sidebar(ctk.CTkScrollableFrame):
             justify="center",
         ).grid(row=row, column=0, columnspan=2, pady=(8, 4))
 
+        # Sub-panel fingerprint jalan — hidden by default, tampil saat checkbox Jalan dicentang
+        self._road_fp_frame.grid_remove()
+
     def _on_input_mode_changed(self, value: str):
         """Toggle between local file and WMS online input modes."""
         if value == "🌐 WMS Online":
@@ -1105,6 +1247,16 @@ class Sidebar(ctk.CTkScrollableFrame):
         elif "64" in pts_str:
             pts_val = 64
 
+        # ── Resolve road fingerprint path ───────────────────────
+        fp_source = self.road_fp_source_var.get()
+        if fp_source == "🔬 Buat Baru":
+            # Fingerprint akan dibuat saat run — path default di output_dir
+            fp_json_path = os.path.join(
+                self._output_dir.get(), "road_fingerprint.json"
+            )
+        else:
+            fp_json_path = self.road_fp_path_var.get().strip()
+
         return {
             "input_path": self._input_path.get(),
             "output_dir": self._output_dir.get(),
@@ -1135,11 +1287,171 @@ class Sidebar(ctk.CTkScrollableFrame):
                 "vegetation": self.veg_mode_var.get(),
             },
             "object_yolo_models": {
-                "road":       self.road_yolo_var.get(),
                 "water":      self.water_yolo_var.get(),
                 "vegetation": self.veg_yolo_var.get(),
             },
+            # ── Road Fingerprint config ─────────────────────────
+            "road_config": {
+                "mode":             "fingerprint" if "Fingerprint" in self.road_mode_var.get() else "color_predetect",
+                "fp_source":        fp_source,
+                "fingerprint_path": fp_json_path,
+                "ref_raster":       self.road_ref_raster_var.get().strip(),
+                "ref_shp":          self.road_ref_shp_var.get().strip(),
+            },
         }
+
+    # ══════════════════════════════════════════════════════════════
+    # Road Fingerprint Event Handlers
+    # ══════════════════════════════════════════════════════════════
+
+    def _on_road_toggled(self):
+        """Show/hide fingerprint sub-panel when Jalan checkbox is toggled."""
+        if self.obj_road_var.get():
+            self._road_fp_frame.grid()
+        else:
+            self._road_fp_frame.grid_remove()
+
+    def _on_road_mode_changed(self, value: str):
+        """Show/hide fingerprint sub-panel based on road mode."""
+        if "Fingerprint" in value:
+            self._road_fp_frame.grid()
+        else:
+            self._road_fp_frame.grid_remove()
+
+    def _on_road_fp_source_changed(self, value: str):
+        """Toggle between Buat Baru and Load Existing sub-forms."""
+        if value == "🔬 Buat Baru":
+            self._road_build_frame.grid()
+            self._road_load_frame.grid_remove()
+        else:
+            self._road_build_frame.grid_remove()
+            self._road_load_frame.grid()
+
+    def _browse_road_ref_raster(self):
+        """Browse for reference raster file."""
+        path = filedialog.askopenfilename(
+            title="Pilih Citra Referensi (ECW / GeoTIFF)",
+            filetypes=[
+                ("Raster Files", "*.ecw *.tif *.tiff *.geotiff"),
+                ("All Files", "*.*"),
+            ]
+        )
+        if path:
+            self.road_ref_raster_var.set(path)
+
+    def _browse_road_ref_shp(self):
+        """Browse for reference road polygon SHP."""
+        path = filedialog.askopenfilename(
+            title="Pilih Polygon Jalan Referensi (Shapefile)",
+            filetypes=[
+                ("Shapefile", "*.shp"),
+                ("All Files", "*.*"),
+            ]
+        )
+        if path:
+            self.road_ref_shp_var.set(path)
+
+    def _browse_road_fp_json(self):
+        """Browse for existing fingerprint JSON."""
+        path = filedialog.askopenfilename(
+            title="Pilih File Road Fingerprint (.json)",
+            filetypes=[
+                ("JSON Files", "*.json"),
+                ("All Files", "*.*"),
+            ]
+        )
+        if path:
+            self.road_fp_path_var.set(path)
+            self.lbl_fp_status.configure(
+                text=f"✅ Fingerprint dimuat: {os.path.basename(path)}",
+                text_color="#10B981",
+            )
+            self.fp_progress.set(1.0)
+
+    def _on_build_fingerprint_clicked(self):
+        """Validate inputs and trigger fingerprint building (Fase 1-4)."""
+        ref_raster = self.road_ref_raster_var.get().strip()
+        ref_shp    = self.road_ref_shp_var.get().strip()
+
+        if not ref_raster:
+            messagebox.showwarning(
+                "Input Kosong",
+                "Silakan pilih Citra Referensi terlebih dahulu."
+            )
+            return
+        if not ref_shp:
+            messagebox.showwarning(
+                "Input Kosong",
+                "Silakan pilih Polygon Jalan Referensi (.shp) terlebih dahulu."
+            )
+            return
+        if not os.path.exists(ref_raster):
+            messagebox.showerror(
+                "File Tidak Ditemukan",
+                f"Citra referensi tidak ditemukan:\n{ref_raster}"
+            )
+            return
+        if not os.path.exists(ref_shp):
+            messagebox.showerror(
+                "File Tidak Ditemukan",
+                f"Shapefile tidak ditemukan:\n{ref_shp}"
+            )
+            return
+
+        # Output path: di folder output
+        output_path = os.path.join(
+            self._output_dir.get(), "road_fingerprint.json"
+        )
+
+        # Trigger via callback (akan ditangkap app.py)
+        self.btn_build_fingerprint.configure(
+            state="disabled", text="⏳  Membangun Fingerprint..."
+        )
+        if hasattr(self, "on_build_fingerprint") and self.on_build_fingerprint:
+            self.on_build_fingerprint(ref_raster, ref_shp, output_path)
+        else:
+            # Fallback: jalankan langsung di thread
+            import threading
+            from core.objects.road_fingerprint import RoadFingerprintBuilder
+
+            def _run():
+                builder = RoadFingerprintBuilder(
+                    log_callback=lambda m: print(m),
+                    progress_callback=lambda p, m: self.after(
+                        0, lambda: self.set_fingerprint_progress(p, m)
+                    ),
+                )
+                try:
+                    builder.build(ref_raster, ref_shp, output_path)
+                    self.after(0, lambda: self.set_fingerprint_idle(
+                        f"✅ Fingerprint disimpan: {os.path.basename(output_path)}",
+                        is_success=True
+                    ))
+                    self.after(0, lambda: self.road_fp_path_var.set(output_path))
+                except Exception as exc:
+                    self.after(0, lambda: self.set_fingerprint_idle(
+                        f"❌ Gagal: {exc}", is_success=False
+                    ))
+
+            threading.Thread(target=_run, daemon=True).start()
+
+    def set_fingerprint_progress(self, percent: float, msg: str):
+        """Update fingerprint build progress (called from worker thread via .after)."""
+        self.fp_progress.set(percent / 100.0)
+        self.lbl_fp_status.configure(
+            text=f"⏳ {msg}", text_color="#F59E0B"
+        )
+
+    def set_fingerprint_idle(self, final_msg: str, is_success: bool = True):
+        """Reset fingerprint button after build completes or fails."""
+        self.btn_build_fingerprint.configure(
+            state="normal", text="🔬  BUAT FINGERPRINT"
+        )
+        self.fp_progress.set(1.0 if is_success else 0.0)
+        self.lbl_fp_status.configure(
+            text=final_msg,
+            text_color="#10B981" if is_success else "#EF4444",
+        )
 
     def _browse_train_geotiff(self):
         path = filedialog.askopenfilename(

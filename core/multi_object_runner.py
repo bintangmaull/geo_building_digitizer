@@ -34,6 +34,8 @@ def _map_mode(sidebar_value: str) -> str:
     v = sidebar_value.lower()
     if "segformer" in v:
         return "segformer"
+    if "fingerprint" in v:
+        return "fingerprint"
     if "otomatis" in v or "grid" in v:
         return "automatic"
     if "yolo" in v:
@@ -189,6 +191,7 @@ def run_multi_object_digitization(
                         bp + int(pct * pe / 100), msg
                     ),
                     cancel_check=is_cancelled,
+                    building_gdf=building_gdf,
                 )
                 if gdf is not None and len(gdf) > 0:
                     gdf["class"] = label
@@ -325,6 +328,7 @@ def _process_single_object(
     log_callback: Callable,
     progress_callback: Callable,
     cancel_check: Callable,
+    building_gdf: Optional["geopandas.GeoDataFrame"] = None,
 ) -> Optional["geopandas.GeoDataFrame"]:
     """Jalankan satu processor objek (SAM-based: predetect, automatic, atau yolo)."""
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -337,13 +341,63 @@ def _process_single_object(
         yolo_model_name = yolo_model_name.split(" (")[0].strip()
 
     if obj_key == "road":
+        mode = params.get("road_config", {}).get("mode", "color_predetect")
+        if mode == "color_predetect" or detection_mode != "fingerprint":
+            raise NotImplementedError(
+                "Mode 'Pra-Deteksi Warna (Lama)' untuk Jalan telah dihapus.\n"
+                "Harap gunakan mode 'Road Fingerprint (Adaptif)'."
+            )
+
         from core.objects.road_processor import RoadProcessor
+        fp_path = params.get("road_config", {}).get("fingerprint_path", "")
+        if not fp_path or not os.path.exists(fp_path):
+            raise FileNotFoundError(
+                f"File Road Fingerprint tidak ditemukan: {fp_path}\n"
+                f"Silakan pilih mode '🔬 Buat Baru' dan klik BUAT FINGERPRINT terlebih dahulu."
+            )
+
         processor = RoadProcessor(
-            sam_model_name=sam_model_name, models_dir=models_dir, device="auto",
-            detection_mode=detection_mode,
-            yolo_model_name=yolo_model_name if detection_mode == "yolo" else None,
-            log_callback=log_callback, progress_callback=progress_callback,
+            fingerprint_path=fp_path,
+            log_callback=log_callback,
+            progress_callback=progress_callback,
         )
+
+        processor.reset_cancel()
+        log_callback(f"  [1/3] Memuat fingerprint untuk {label}...")
+        processor.load_fingerprint()
+        
+        if cancel_check():
+            return None
+
+        log_callback(f"  [2/3] Memproses tile-by-tile ({label})...")
+        out_dir = params.get("output_dir", os.path.dirname(masks_dir))
+        
+        poly_gdf, line_gdf = processor.process_raster(
+            raster_path=raster_path,
+            output_dir=masks_dir,  # Hanya untuk temporary temp/masks_road
+            tile_size=tile_size,
+            overlap=tile_size // 8,
+            min_area_m2=min_area_m2,
+            building_gdf=building_gdf,
+        )
+
+        if cancel_check():
+            return None
+
+        # [3/3] Simpan centerline langsung (postprocess jalan sudah di-handle di process_raster)
+        log_callback(f"  [3/3] Menyelesaikan output {label}...")
+        if line_gdf is not None and len(line_gdf) > 0:
+            stem = Path(raster_path).stem
+            centerline_shp = os.path.join(out_dir, f"{stem}_jalan_centerline.shp")
+            log_callback(f"  💾 Menyimpan Centerline Jalan ke: {centerline_shp}")
+            try:
+                line_gdf.to_file(centerline_shp)
+            except Exception as e:
+                log_callback(f"  ⚠️ Gagal menyimpan centerline: {e}")
+
+        # Mengembalikan polygon GDF untuk priority clipping gabungan
+        return poly_gdf
+
     elif obj_key == "water":
         from core.objects.water_processor import WaterProcessor
         processor = WaterProcessor(
@@ -367,35 +421,36 @@ def _process_single_object(
     processor.reset_cancel()
 
     try:
-        log_callback(f"  [1/3] Memuat model untuk {label}...")
-        processor.load_model()
+        if obj_key != "road":
+            log_callback(f"  [1/3] Memuat model untuk {label}...")
+            processor.load_model()
 
-        if cancel_check():
-            return None
+            if cancel_check():
+                return None
 
-        log_callback(f"  [2/3] Segmentasi tile-by-tile ({label})...")
-        mask_results = processor.process_raster(
-            raster_path=raster_path,
-            masks_dir=masks_dir,
-            tile_size=tile_size,
-            overlap=tile_size // 8,
-            min_area_m2=min_area_m2,
-            max_area_m2=max_area_m2,
-        )
+            log_callback(f"  [2/3] Segmentasi tile-by-tile ({label})...")
+            mask_results = processor.process_raster(
+                raster_path=raster_path,
+                masks_dir=masks_dir,
+                tile_size=tile_size,
+                overlap=tile_size // 8,
+                min_area_m2=min_area_m2,
+                max_area_m2=max_area_m2,
+            )
 
-        if cancel_check() or not mask_results:
-            return None
+            if cancel_check() or not mask_results:
+                return None
 
-        log_callback(f"  [3/3] Post-processing {label}...")
-        gdf = processor.postprocess(
-            mask_results=mask_results,
-            original_raster_path=raster_path,
-            min_area_m2=min_area_m2,
-            max_area_m2=max_area_m2,
-            log_callback=log_callback,
-        )
-        return gdf
-
+            log_callback(f"  [3/3] Post-processing {label}...")
+            gdf = processor.postprocess(
+                mask_results=mask_results,
+                original_raster_path=raster_path,
+                min_area_m2=min_area_m2,
+                max_area_m2=max_area_m2,
+                log_callback=log_callback,
+            )
+            return gdf
+        
     finally:
         try:
             processor.unload_model()

@@ -1,80 +1,78 @@
 """
 road_processor.py
-Processor untuk digitasi Jalan & Infrastruktur dari citra drone/satelit.
+Pipeline digitasi Jalan & Infrastruktur berbasis Road Fingerprint + Mahalanobis Distance.
 
-Objek yang dideteksi:
-    - Jalan (aspal, beton, tanah)
-    - Jembatan
-    - Rel kereta api
-    - Area parkir (sebagai poligon lebar)
+Pipeline (Fase 5–11):
+  Fase 5  — Scoring         : Mahalanobis distance → probability map per piksel
+  Fase 6  — Masking         : Threshold + exclude vegetasi
+  Fase 7  — Morphology      : Close gap, hapus blob kecil & terlalu bulat
+  Fase 8  — Skeletonization : Distance transform + medial axis → centerline
+  Fase 9  — Vectorize       : Skeleton → graph → prune → LineString halus
+  Fase 10 — Adaptive Buffer : Buffer adaptif lebar per segmen → Polygon
+  Fase 11 — Post-process    : Simplify, area filter
 
-Pipeline:
-    1. Tiling raster input
-    2. Deteksi kandidat area jalan via OpenCV (warna abu-abu aspal, low saturation)
-    3. Segmentasi SAM menggunakan point/box prompts dari deteksi CV
-    4. Post-processing khusus jalan:
-       - Filter elongated (aspek rasio >= 2.0)
-       - Filter lebar minimal (>= 3 m)
-       - Tidak ada regularisasi 90° (jalan bisa melengkung)
-       - Tidak ada filter vegetasi/bayangan
+Output: 2 SHP
+  - *_jalan_polygon.shp   : Polygon lebar jalan (dari adaptive buffer)
+  - *_jalan_centerline.shp: LineString garis tengah jalan (dari centerline)
 
-CATATAN: File ini BERDIRI SENDIRI dan tidak mengimpor dari postprocess.py
-         atau sam_processor.py (kode bangunan tidak disentuh).
+CATATAN: File ini berdiri sendiri dan TIDAK mengimpor dari postprocess.py
+         (kode bangunan tidak disentuh).
 """
 
 import os
 import gc
+import json
 import threading
+import warnings
 import numpy as np
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
+warnings.filterwarnings("ignore")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Konstanta internal (tidak diekspos ke UI)
+# ──────────────────────────────────────────────────────────────────────────────
+_MAHAL_THRESHOLD     = 3.0   # sigma — piksel dengan dist > threshold dianggap bukan jalan
+_MIN_BLOB_AREA_PX    = 200   # pixel² — blob terlalu kecil dihapus
+_MAX_COMPACTNESS     = 0.65  # Polsby-Popper — blob terlalu bulat dihapus (bukan jalan)
+_MORPH_CLOSE_RADIUS  = 5     # pixel — radius morphological closing untuk tutup gap
+_MIN_BRANCH_LEN_PX   = 20    # pixel — dead-end pendek di-prune
+_SMOOTH_WINDOW       = 5     # node — window spline smoothing centerline
+
 
 class RoadProcessor:
     """
-    Processor mandiri untuk deteksi dan segmentasi Jalan & Infrastruktur.
-    Menggunakan SAM untuk segmentasi dengan prompt dari deteksi warna OpenCV.
+    Processor mandiri untuk digitasi Jalan & Infrastruktur.
+    Menggunakan Road Fingerprint (road_fingerprint.json) sebagai acuan
+    karakteristik visual jalan.
+
+    Cara pemakaian:
+        processor = RoadProcessor(fingerprint_path="road_fingerprint.json", ...)
+        polygon_gdf, centerline_gdf = processor.process_raster(target_path, ...)
     """
 
-    OBJECT_CLASS = "Jalan"
-    OBJECT_COLOR = "#FF6B35"   # Orange — untuk preview panel
+    OBJECT_CLASS  = "Jalan"
+    OBJECT_COLOR  = "#FF6B35"
 
     def __init__(
         self,
-        sam_model_name: str = "SAM2-Small (Seimbang, ~185MB)",
-        models_dir: str = "models",
-        device: str = "auto",
-        points_per_side: int = 32,
-        detection_mode: str = "predetect",   # "predetect" | "automatic" | "yolo"
-        yolo_model_name: Optional[str] = None,
+        fingerprint_path: str,
         log_callback: Optional[Callable[[str], None]] = None,
         progress_callback: Optional[Callable[[int, str], None]] = None,
     ):
-        self.sam_model_name = sam_model_name
-        self.models_dir = os.path.abspath(models_dir)
-        self.points_per_side = points_per_side
-        self.detection_mode = detection_mode
-        self.yolo_model_name = yolo_model_name
-
-        self.log_callback = log_callback or (lambda msg: print(msg))
+        """
+        Args:
+            fingerprint_path: Path ke road_fingerprint.json hasil Fase 1–4
+        """
+        self.fingerprint_path = fingerprint_path
+        self.log_callback     = log_callback or (lambda msg: print(msg))
         self.progress_callback = progress_callback or (lambda pct, msg: None)
-        self._cancel_event = threading.Event()
-        self._sam = None
-        self._yolo = None
-        self._is_sam2 = False
-
-        # Determine device
-        if device == "auto":
-            try:
-                import torch
-                self.device = "cuda" if torch.cuda.is_available() else "cpu"
-            except ImportError:
-                self.device = "cpu"
-        else:
-            self.device = device
+        self._cancel_event    = threading.Event()
+        self._fingerprint     = None   # Loaded on demand
 
     def cancel(self):
-        """Request cancellation."""
         self._cancel_event.set()
 
     def is_cancelled(self) -> bool:
@@ -89,323 +87,631 @@ class RoadProcessor:
     def _progress(self, pct: int, msg: str):
         self.progress_callback(pct, msg)
 
-    # ──────────────────────────────────────────────────────────────
-    # Model Loading
-    # ──────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────────────
+    # Load Fingerprint
+    # ──────────────────────────────────────────────────────────────────────────
 
-    def load_model(self):
-        """Muat model SAM/SAM2 ke memori."""
-        self._log(f"Memuat model SAM: {self.sam_model_name} [Mode: {self.detection_mode}]")
+    def load_fingerprint(self):
+        """Muat road_fingerprint.json ke memori."""
+        if not os.path.isfile(self.fingerprint_path):
+            raise FileNotFoundError(
+                f"Road Fingerprint tidak ditemukan: {self.fingerprint_path}\n"
+                f"Silakan buat fingerprint terlebih dahulu menggunakan 'Buat Fingerprint'."
+            )
+        with open(self.fingerprint_path, "r") as f:
+            self._fingerprint = json.load(f)
+        self._log(f"Fingerprint dimuat: {Path(self.fingerprint_path).name}")
+        self._log(f"  Sumber referensi: {self._fingerprint.get('source_raster', '?')}")
 
-        # Jika automatic, SAM perlu diinisialisasi dengan automatic=True
-        is_auto = (self.detection_mode == "automatic")
+    # ══════════════════════════════════════════════════════════════════════════
+    # FASE 5: SCORING (Mahalanobis Distance → Probability Map)
+    # ══════════════════════════════════════════════════════════════════════════
 
-        # Import MODEL_CONFIGS dari SAM processor (hanya konfigurasi, bukan kode pipeline)
-        MODEL_CONFIGS = {
-            "SAM2-Tiny (Cepat, ~155MB)":        {"type": "sam2", "model_id": "sam2-hiera-tiny"},
-            "SAM2-Small (Seimbang, ~185MB)":     {"type": "sam2", "model_id": "sam2-hiera-small"},
-            "SAM2-Base+ (Akurat, ~325MB)":       {"type": "sam2", "model_id": "sam2-hiera-base-plus"},
-            "SAM2-Large (Sangat Akurat, ~898MB)":{"type": "sam2", "model_id": "sam2-hiera-large"},
-            "SAM-B (Seimbang, ~375MB)":          {"type": "vit_b", "checkpoint": "sam_vit_b_01ec64.pth",
-                                                   "download_url": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"},
-            "SAM-L (Akurat, ~1.2GB)":            {"type": "vit_l", "checkpoint": "sam_vit_l_0b3195.pth",
-                                                   "download_url": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth"},
-            "SAM-H (Sangat Akurat, ~2.4GB)":     {"type": "vit_h", "checkpoint": "sam_vit_h_4b8939.pth",
-                                                   "download_url": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"},
-        }
-
-        cfg = MODEL_CONFIGS.get(self.sam_model_name,
-                                MODEL_CONFIGS["SAM2-Small (Seimbang, ~185MB)"])
-        model_type = cfg.get("type")
-
-        try:
-            if model_type == "sam2":
-                from samgeo import SamGeo2
-                self._sam = SamGeo2(
-                    model_id=cfg["model_id"],
-                    device=self.device,
-                    automatic=is_auto,
-                    points_per_side=self.points_per_side if is_auto else None,
-                    pred_iou_thresh=0.72 if is_auto else None,
-                    stability_score_thresh=0.75 if is_auto else None,
-                    min_mask_region_area=100 if is_auto else None,
-                )
-                self._is_sam2 = True
-                self._log(f"SAM2 ({cfg['model_id']}) dimuat di {self.device.upper()}")
-            else:
-                from samgeo import SamGeo
-                model_path = os.path.join(self.models_dir, cfg["checkpoint"])
-                if not os.path.exists(model_path):
-                    import urllib.request
-                    self._log(f"Mengunduh {cfg['checkpoint']}...")
-                    urllib.request.urlretrieve(cfg["download_url"], model_path)
-
-                self._sam = SamGeo(
-                    model_type=model_type,
-                    checkpoint=model_path,
-                    device=self.device,
-                    automatic=is_auto,
-                    sam_kwargs={
-                        "points_per_side": self.points_per_side,
-                        "pred_iou_thresh": 0.72,
-                        "stability_score_thresh": 0.75,
-                        "crop_n_layers": 0,
-                        "min_mask_region_area": 100,
-                    } if is_auto else None,
-                )
-                self._log(f"SAM ({model_type}) dimuat di {self.device.upper()}")
-        except Exception as e:
-            raise RuntimeError(f"Gagal memuat model SAM untuk Jalan: {e}")
-
-        # Load YOLO if needed
-        if self.detection_mode == "yolo" and self.yolo_model_name:
-            try:
-                from ultralytics import YOLO
-                yolo_path = os.path.join(self.models_dir, self.yolo_model_name)
-                if not os.path.exists(yolo_path):
-                    self._log(f"⚠️ Model YOLO {self.yolo_model_name} tidak ditemukan!", "warning")
-                else:
-                    self._yolo = YOLO(yolo_path)
-                    self._log(f"Model YOLO {self.yolo_model_name} dimuat.")
-            except ImportError:
-                self._log("⚠️ Gagal memuat YOLO (ultralytics belum terinstal)", "warning")
-            except Exception as e:
-                self._log(f"⚠️ Gagal memuat YOLO: {e}", "warning")
-
-    def unload_model(self):
-        """Bebaskan model dari memori."""
-        if self._sam is not None:
-            del self._sam
-            self._sam = None
-        
-        if self._yolo is not None:
-            del self._yolo
-            self._yolo = None
-
-        gc.collect()
-        if self.device == "cuda":
-            try:
-                import torch
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-        self._log("Model dibebaskan dari memori")
-
-    # ──────────────────────────────────────────────────────────────
-    # Deteksi Kandidat Jalan (OpenCV, berbasis warna)
-    # ──────────────────────────────────────────────────────────────
-
-    def detect_road_points(
-        self,
-        image_path: str,
-        min_area_px: float = 500.0,
-        max_area_px: float = 500000.0,
-    ) -> Tuple[List[List[int]], List[int]]:
+    def _score_tile(self, tile_img_norm: np.ndarray) -> np.ndarray:
         """
-        Deteksi kandidat area jalan menggunakan OpenCV.
+        Hitung road probability map [0–1] untuk satu tile.
 
-        Karakteristik spektral jalan dari citra drone:
-        - Warna abu-abu (aspal) atau putih (beton): saturation rendah, brightness sedang-tinggi
-        - Bukan hijau (vegetasi) dan bukan sangat gelap (bayangan)
-        - Bentuk memanjang (aspek rasio > 2.0)
+        Args:
+            tile_img_norm: (H, W, C) citra tile setelah normalisasi percentile stretch
 
         Returns:
-            (point_coords, point_labels) — centroid dari kandidat jalan
+            prob_map: (H, W) float32, nilai 1.0 = sangat mirip profil jalan
+        """
+        from core.objects.road_fingerprint import RoadFingerprintBuilder
+
+        fp  = self._fingerprint["fingerprint"]
+        loc = np.array(fp["mahalanobis"]["location"], dtype=np.float64)
+        VI  = np.array(fp["mahalanobis"]["precision_matrix"], dtype=np.float64)
+
+        # Ekstrak fitur per piksel
+        features, _ = RoadFingerprintBuilder.extract_features(tile_img_norm)
+        H, W, F = features.shape
+        flat = features.reshape(-1, F).astype(np.float64)
+
+        # Mahalanobis distance — per piksel (batch)
+        diff = flat - loc[np.newaxis, :]           # (N, F)
+        dist = np.sqrt(np.maximum(
+            np.einsum("ni,ij,nj->n", diff, VI, diff), 0
+        ))                                          # (N,) — Mahalanobis distance
+
+        # Konversi ke probability [0–1] via exp(-0.5 * d²)
+        # Makin kecil distance → makin besar probability
+        prob = np.exp(-0.5 * (dist / _MAHAL_THRESHOLD) ** 2)
+        return prob.reshape(H, W).astype(np.float32)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # FASE 6: MASKING
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _apply_mask(
+        self,
+        prob_map: np.ndarray,
+        img_norm: np.ndarray,
+        threshold: float = 0.45,
+        building_mask: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Buat binary road mask dari probability map.
+        [FIX 1] Subtract building mask lebih awal (jika ada).
+        Eksklusikan:
+          - Piksel dengan probabilitas rendah (< threshold)
+          - Piksel vegetasi (ExG tinggi)
+        """
+        if building_mask is not None:
+            prob_map[building_mask == 1] = 0.0
+
+        # Threshold probability
+        binary = (prob_map >= threshold).astype(np.uint8) * 255
+
+        # Exclude vegetasi (ExG tinggi)
+        R = img_norm[:, :, 0].astype(float)
+        G = img_norm[:, :, 1].astype(float)
+        B = img_norm[:, :, 2].astype(float) if img_norm.shape[2] >= 3 else np.zeros_like(R)
+        exg = 2.0 * G - R - B
+        veg_mask = (exg > 15).astype(np.uint8)
+        binary[veg_mask == 1] = 0
+
+        return binary
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # FASE 7: MORPHOLOGY
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _morphology(
+        self,
+        binary_mask: np.ndarray,
+        close_radius: int = _MORPH_CLOSE_RADIUS,
+        min_area_px: int = _MIN_BLOB_AREA_PX,
+        min_elongation: float = 2.5,
+        max_solidity: float = 0.85,
+    ) -> np.ndarray:
+        """
+        Morphological cleaning:
+          1. Morphological closing (tutup gap kecil antar piksel jalan)
+          2. Hapus blob terlalu kecil (noise)
+          [FIX 2] 3. Hapus blob dengan Solidity > max_solidity (kemungkinan bangunan)
+          [FIX 2] 4. Hapus blob dengan Elongation < min_elongation (kemungkinan bangunan)
         """
         import cv2
-        import numpy as np
+        import math
 
-        img = cv2.imread(image_path)
-        if img is None:
-            return [], []
+        # 1. Morphological Closing
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (close_radius * 2 + 1, close_radius * 2 + 1)
+        )
+        closed = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel)
 
-        h_img, w_img = img.shape[:2]
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        # 2, 3, 4. Filter per blob
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            closed, connectivity=8
+        )
+        cleaned = np.zeros_like(closed)
+        for label in range(1, n_labels):
+            area = stats[label, cv2.CC_STAT_AREA]
+            if area < min_area_px:
+                continue  # Terlalu kecil → hapus
 
-        # --- 1. Mask Vegetasi (hijau) — untuk eksklusi ---
-        lower_green = np.array([35, 30, 30])
-        upper_green = np.array([85, 255, 255])
-        green_mask = cv2.inRange(hsv, lower_green, upper_green)
-
-        b, g, r = cv2.split(img.astype(float))
-        exg = 2.0 * g - r - b
-        exg_mask = (exg > 15).astype(np.uint8) * 255
-        veg_mask = cv2.bitwise_or(green_mask, exg_mask)
-
-        # --- 2. Mask Bayangan (sangat gelap) ---
-        lower_shadow = np.array([0, 0, 0])
-        upper_shadow = np.array([180, 255, 50])
-        shadow_mask = cv2.inRange(hsv, lower_shadow, upper_shadow)
-
-        # --- 3. Deteksi warna aspal/beton (abu-abu, saturation rendah) ---
-        # Aspal: HSV Saturation rendah (< 60), Value sedang (40–220)
-        lower_road = np.array([0, 0, 40])
-        upper_road = np.array([180, 60, 220])
-        road_mask = cv2.inRange(hsv, lower_road, upper_road)
-
-        # Eksklusi vegetasi dan bayangan dari mask jalan
-        road_clean = cv2.bitwise_and(road_mask, cv2.bitwise_not(veg_mask))
-        road_clean = cv2.bitwise_and(road_clean, cv2.bitwise_not(shadow_mask))
-
-        # --- 4. Morfologi untuk menutup gap pada jalan ---
-        kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-        road_processed = cv2.morphologyEx(road_clean, cv2.MORPH_OPEN, kernel_open)
-        road_processed = cv2.morphologyEx(road_processed, cv2.MORPH_CLOSE, kernel_close)
-
-        # --- 5. Temukan contour & filter berdasarkan aspek rasio ---
-        contours, _ = cv2.findContours(road_processed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        coords = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < min_area_px or area > max_area_px:
+            # Ambil kontur untuk menghitung fitur bentuk
+            blob_mask = (labels == label).astype(np.uint8)
+            contours, _ = cv2.findContours(
+                blob_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            if not contours:
                 continue
+                
+            cnt = contours[0]
+            
+            # [FIX 2] Solidity = area / convex_hull_area
+            hull = cv2.convexHull(cnt)
+            hull_area = cv2.contourArea(hull)
+            if hull_area > 0:
+                solidity = area / hull_area
+                if solidity > max_solidity:
+                    continue  # Terlalu solid/kotak → hapus
+                    
+            # [FIX 2] Elongation = major_axis / minor_axis
+            if len(cnt) >= 5:  # fitEllipse butuh minimal 5 titik
+                (x, y), (minor, major), angle = cv2.fitEllipse(cnt)
+                if minor > 0:
+                    elongation = major / minor
+                    if elongation < min_elongation:
+                        continue  # Terlalu membulat/persegi → hapus
 
-            x, y, w, h = cv2.boundingRect(cnt)
-            aspect = max(w, h) / max(min(w, h), 1)
+            cleaned[labels == label] = 255
 
-            # Jalan biasanya memanjang: aspek rasio >= 2.0
-            # Atau area besar (persimpangan/parkiran) aspek rasio bisa kecil
-            if aspect >= 2.0 or area >= 5000:
-                M = cv2.moments(cnt)
-                if M["m00"] != 0:
-                    cx = int(M["m10"] / M["m00"])
-                    cy = int(M["m01"] / M["m00"])
-                    if 0 <= cx < w_img and 0 <= cy < h_img:
-                        if veg_mask[cy, cx] == 0:
-                            coords.append([cx, cy])
+        return cleaned
 
-        if not coords:
+    # ══════════════════════════════════════════════════════════════════════════
+    # FASE 8: SKELETONIZATION
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _skeletonize(
+        self,
+        binary_mask: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Hasilkan:
+          - skeleton    : (H, W) bool — centerline 1-pixel width
+          - dist_transform: (H, W) float32 — lebar lokal / 2 per piksel
+
+        Returns:
+            (skeleton, dist_transform)
+        """
+        try:
+            from skimage.morphology import medial_axis
+            from scipy.ndimage import distance_transform_edt
+        except ImportError:
+            raise ImportError(
+                "scikit-image & scipy diperlukan. "
+                "Install: pip install scikit-image scipy"
+            )
+
+        mask_bool = binary_mask > 0
+
+        # Distance transform — nilai = jarak tiap piksel ke tepi mask
+        # Artinya: lebar jalan lokal ≈ 2 × dist_transform pada centerline
+        dist_transform = distance_transform_edt(mask_bool).astype(np.float32)
+
+        # Medial axis — thinning ke centerline 1-pixel
+        skeleton, _ = medial_axis(mask_bool, return_distance=False), None
+        # Alternatif: pakai morphological skeleton jika medial_axis lambat
+        # skeleton = morphology.skeletonize(mask_bool)
+
+        return skeleton.astype(np.uint8), dist_transform
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # FASE 9: VECTORIZE CENTERLINE
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _skeleton_to_linestrings(
+        self,
+        skeleton: np.ndarray,
+        dist_transform: np.ndarray,
+        transform,
+        min_branch_len: int = _MIN_BRANCH_LEN_PX,
+        smooth_window: int = _SMOOTH_WINDOW,
+        pixel_size_m: float = 0.1,
+    ) -> list:
+        """
+        Konversi skeleton pixel → list LineString (koordinat geo).
+
+        Steps:
+          1. Skeleton pixel → graph (8-connectivity)
+          2. Prune dead-end pendek (< min_branch_len)
+          [FIX 3] 3. Gap Filling (menyambung dead-end yang terputus < 20m)
+          4. Traversal graph → segmen koordinat pixel
+          5. Pixel → koordinat geo via rasterio transform
+          6. Smooth LineString dengan moving average
+        """
+        import networkx as nx
+        import math
+        from itertools import combinations
+        from shapely.geometry import LineString
+
+        H, W = skeleton.shape
+        skel_pts = np.argwhere(skeleton > 0)  # (row, col)
+        if len(skel_pts) == 0:
             return [], []
 
-        labels = [1] * len(coords)
-        return coords, labels
+        # Build graph
+        G = nx.Graph()
+        skel_set = set(map(tuple, skel_pts))
 
-    # ──────────────────────────────────────────────────────────────
-    # Segmentasi SAM Single Tile
-    # ──────────────────────────────────────────────────────────────
+        for (r, c) in skel_pts:
+            G.add_node((r, c))
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    nb = (r + dr, c + dc)
+                    if nb in skel_set:
+                        dist = 1.414 if (dr != 0 and dc != 0) else 1.0
+                        G.add_edge((r, c), nb, weight=dist)
 
-    def process_tile(
+        # Prune dead-ends pendek
+        changed = True
+        while changed:
+            changed = False
+            leaves = [n for n in G.nodes() if G.degree(n) == 1]
+            for leaf in leaves:
+                # Telusuri cabang dari leaf sampai non-leaf atau panjang >= min_branch_len
+                path = [leaf]
+                cur = leaf
+                prev = None
+                while True:
+                    nbs = [n for n in G.neighbors(cur) if n != prev]
+                    if len(nbs) != 1:
+                        break  # Bukan dead-end lagi
+                    prev = cur
+                    cur  = nbs[0]
+                    path.append(cur)
+                    if len(path) >= min_branch_len:
+                        break
+                if len(path) < min_branch_len and G.degree(path[-1]) != 1:
+                    # Hapus semua node di cabang kecuali junction
+                    for node in path[:-1]:
+                        G.remove_node(node)
+                    changed = True
+
+        if G.number_of_nodes() == 0:
+            return [], []
+
+        # [FIX 3] Connectivity-Aware Gap Filling
+        # Sambungkan dead-end berdekatan (jarak < 20 meter & saling berhadapan)
+        gap_fill_radius_m = 20.0
+        gap_fill_radius_px = gap_fill_radius_m / pixel_size_m if pixel_size_m > 0 else 50
+        leaves = [n for n in G.nodes() if G.degree(n) == 1]
+        
+        def get_leaf_vector(leaf):
+            nbs = list(G.neighbors(leaf))
+            if not nbs: return (0, 0)
+            nb = nbs[0]
+            return (leaf[0] - nb[0], leaf[1] - nb[1])
+            
+        for u, v in combinations(leaves, 2):
+            if G.has_edge(u, v): continue
+            
+            dist = math.hypot(u[0] - v[0], u[1] - v[1])
+            if dist > gap_fill_radius_px:
+                continue
+                
+            # Hanya sambungkan jika mereka tidak terhubung
+            if nx.has_path(G, u, v):
+                if nx.shortest_path_length(G, u, v, weight=None) < dist * 2:
+                    continue
+                    
+            vec_u = get_leaf_vector(u)
+            vec_v = get_leaf_vector(v)
+            mag_u = math.hypot(vec_u[0], vec_u[1]) + 1e-6
+            mag_v = math.hypot(vec_v[0], vec_v[1]) + 1e-6
+            nu = (vec_u[0]/mag_u, vec_u[1]/mag_u)
+            nv = (vec_v[0]/mag_v, vec_v[1]/mag_v)
+            
+            vec_uv = (v[0] - u[0], v[1] - u[1])
+            mag_uv = math.hypot(vec_uv[0], vec_uv[1]) + 1e-6
+            n_uv = (vec_uv[0]/mag_uv, vec_uv[1]/mag_uv)
+            
+            dot_u = nu[0]*n_uv[0] + nu[1]*n_uv[1]
+            dot_v = nv[0]*(-n_uv[0]) + nv[1]*(-n_uv[1])
+            
+            if dot_u > 0.5 and dot_v > 0.5:
+                G.add_edge(u, v, weight=dist)
+
+        # Traversal edge-paths dari graph
+        def _pixel_to_geo(r, c):
+            """Pixel (row, col) → (lon, lat) atau (x, y)."""
+            x, y = transform * (c + 0.5, r + 0.5)
+            return (x, y)
+
+        lines  = []
+        widths = []
+        visited_edges = set()
+
+        # Mulai traversal dari node-node junction atau endpoint
+        for start_node in list(G.nodes()):
+            for end_node in list(G.neighbors(start_node)):
+                edge_key = tuple(sorted([start_node, end_node]))
+                if edge_key in visited_edges:
+                    continue
+                visited_edges.add(edge_key)
+
+                # Kumpulkan koordinat geo
+                coords = [_pixel_to_geo(*start_node), _pixel_to_geo(*end_node)]
+
+                # Lebar: rata-rata dist_transform di node-node ini
+                r1, c1 = start_node
+                r2, c2 = end_node
+                d1 = dist_transform[r1, c1] if 0 <= r1 < H and 0 <= c1 < W else 1.0
+                d2 = dist_transform[r2, c2] if 0 <= r2 < H and 0 <= c2 < W else 1.0
+                avg_width_px = (d1 + d2) / 2.0
+                widths.append(avg_width_px)
+
+                if len(coords) >= 2:
+                    lines.append(LineString(coords))
+
+        # Gabungkan segmen pendek yang satu-arah menjadi LineString lebih panjang
+        lines, widths = self._merge_line_segments(G, transform, dist_transform, H, W)
+
+        return lines, widths
+
+    def _merge_line_segments(
         self,
-        tile_path: str,
-        output_mask_path: str,
-        point_coords: Optional[List[List[int]]] = None,
-        point_labels: Optional[List[int]] = None,
-        boxes: Optional[List[List[float]]] = None,
-    ) -> bool:
-        """Segmentasi SAM untuk satu tile citra jalan."""
-        if self.is_cancelled():
-            return False
-        if self._sam is None:
-            raise RuntimeError("Model belum dimuat. Panggil load_model() terlebih dahulu.")
+        G,
+        transform,
+        dist_transform: np.ndarray,
+        H: int,
+        W: int,
+    ) -> Tuple[list, list]:
+        """
+        Traversal DFS dari semua ujung/junction, gabungkan node menjadi
+        LineString panjang (bukan edge-per-edge pendek).
+        """
+        from shapely.geometry import LineString
 
-        if not point_coords and not boxes:
-            return False
+        def _pixel_to_geo(r, c):
+            x, y = transform * (c + 0.5, r + 0.5)
+            return (x, y)
 
-        try:
-            import rasterio
-            import numpy as np
+        def _get_width(r, c):
+            if 0 <= r < H and 0 <= c < W:
+                return float(dist_transform[r, c])
+            return 1.0
 
-            self._sam.set_image(tile_path)
+        lines  = []
+        widths = []
+        visited_nodes = set()
 
-            with rasterio.open(tile_path) as src:
-                h, w = src.height, src.width
-                meta = src.meta.copy()
-                meta.update(dtype="uint16", count=1, nodata=0)
+        # Start dari junction (degree != 2) atau endpoint (degree == 1)
+        start_nodes = [n for n in G.nodes() if G.degree(n) != 2]
+        if not start_nodes:
+            start_nodes = list(G.nodes())[:1]
 
-            master_mask = np.zeros((h, w), dtype=np.uint16)
-            temp_dir = os.path.dirname(output_mask_path)
-            temp_path = os.path.join(temp_dir, f"_tmp_road_{Path(tile_path).name}")
+        for start in start_nodes:
+            for nb in G.neighbors(start):
+                if (start, nb) in visited_nodes or (nb, start) in visited_nodes:
+                    continue
 
-            if boxes:
-                for idx, box in enumerate(boxes):
-                    if self.is_cancelled(): return False
-                    try:
-                        if os.path.exists(temp_path): os.remove(temp_path)
-                        # Clip box to valid coordinates to prevent SAM errors
-                        x1, y1, x2, y2 = box
-                        x1, x2 = max(0, min(x1, w)), max(0, min(x2, w))
-                        y1, y2 = max(0, min(y1, h)), max(0, min(y2, h))
-                        if abs(x2 - x1) < 2 or abs(y2 - y1) < 2:
-                            continue
-                            
-                        self._sam.predict(
-                            boxes=[x1, y1, x2, y2],
-                            output=temp_path,
-                        )
-                        if os.path.exists(temp_path):
-                            with rasterio.open(temp_path) as p_src:
-                                pmask = p_src.read(1)
-                                road_id = idx + 1
-                                master_mask = np.where(pmask > 0, road_id, master_mask)
-                    except Exception as pe:
-                        self._log(f"  ⚠️ Gagal segmentasi box {box}: {pe}")
-            elif point_coords and point_labels:
-                for idx, (coord, label) in enumerate(zip(point_coords, point_labels)):
-                    if self.is_cancelled():
-                        return False
-                    try:
-                        if os.path.exists(temp_path):
-                            os.remove(temp_path)
-                        self._sam.predict(
-                            point_coords=[coord],
-                            point_labels=[label],
-                            output=temp_path,
-                        )
-                        if os.path.exists(temp_path):
-                            with rasterio.open(temp_path) as p_src:
-                                pmask = p_src.read(1)
-                                road_id = idx + 1
-                                master_mask = np.where(pmask > 0, road_id, master_mask)
-                    except Exception as pe:
-                        self._log(f"  ⚠️ Gagal segmentasi titik {coord}: {pe}")
+                # Traversal chain
+                path  = [start, nb]
+                widths_path = [_get_width(*start), _get_width(*nb)]
+                visited_nodes.add((start, nb))
 
-            if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except Exception:
-                    pass
+                cur  = nb
+                prev = start
+                while G.degree(cur) == 2:
+                    nbs = [n for n in G.neighbors(cur) if n != prev]
+                    if not nbs:
+                        break
+                    nxt = nbs[0]
+                    edge_key = (min(cur, nxt), max(cur, nxt))
+                    if edge_key in visited_nodes:
+                        break
+                    visited_nodes.add(edge_key)
+                    path.append(nxt)
+                    widths_path.append(_get_width(*nxt))
+                    prev = cur
+                    cur  = nxt
 
-            with rasterio.open(output_mask_path, "w", **meta) as dst:
-                dst.write(master_mask.astype(np.uint16), 1)
+                if len(path) < 2:
+                    continue
 
-            return True
+                # Smooth koordinat dengan moving average sederhana
+                coords = [_pixel_to_geo(r, c) for r, c in path]
+                coords = self._smooth_coords(coords, window=_SMOOTH_WINDOW)
 
-        except Exception as e:
-            self._log(f"Error proses tile {Path(tile_path).name}: {e}")
-            return False
+                if len(coords) >= 2:
+                    lines.append(LineString(coords))
+                    widths.append(float(np.mean(widths_path)))
 
-    # ──────────────────────────────────────────────────────────────
-    # Pipeline Utama: Proses Seluruh Raster
-    # ──────────────────────────────────────────────────────────────
+        return lines, widths
+
+    @staticmethod
+    def _smooth_coords(coords: list, window: int = 5) -> list:
+        """Moving average smoothing pada list koordinat (x, y)."""
+        if len(coords) <= window:
+            return coords
+        coords_arr = np.array(coords, dtype=float)
+        half = window // 2
+        smoothed = []
+        for i in range(len(coords_arr)):
+            i0 = max(0, i - half)
+            i1 = min(len(coords_arr), i + half + 1)
+            smoothed.append(coords_arr[i0:i1].mean(axis=0))
+        return [tuple(p) for p in smoothed]
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # FASE 10: ADAPTIVE BUFFER
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _adaptive_buffer(
+        self,
+        lines: list,
+        widths_px: list,
+        pixel_size_m: float,
+        min_width_m: float = 3.0,
+    ) -> "geopandas.GeoDataFrame":
+        """
+        Buffer adaptif per segmen LineString berdasarkan lebar dari distance transform.
+
+        Args:
+            lines       : list of shapely LineString (geo-coordinates)
+            widths_px   : list of float — lebar rata-rata tiap segmen dalam pixel
+            pixel_size_m: ukuran pixel dalam meter
+            min_width_m : lebar minimum jalan (meter)
+
+        Returns:
+            GeoDataFrame dengan kolom geometry (Polygon)
+        """
+        import geopandas as gpd
+        from shapely.ops import unary_union
+
+        polygons = []
+        for line, w_px in zip(lines, widths_px):
+            # Lebar jalan = 2 × radius distance transform (karena dist = jarak ke tepi)
+            width_m = max(w_px * 2.0 * pixel_size_m, min_width_m)
+            buf = line.buffer(
+                width_m / 2.0,
+                cap_style=2,   # flat cap
+                join_style=1,  # round join
+            )
+            if buf and not buf.is_empty:
+                polygons.append(buf)
+
+        if not polygons:
+            return gpd.GeoDataFrame(geometry=[], crs=None)
+
+        # Union semua buffer → MultiPolygon bersih
+        from shapely.geometry import MultiPolygon, Polygon
+        merged = unary_union(polygons)
+        if isinstance(merged, Polygon):
+            geom_list = [merged]
+        elif isinstance(merged, MultiPolygon):
+            geom_list = list(merged.geoms)
+        elif hasattr(merged, "geoms"):
+            geom_list = [g for g in merged.geoms if isinstance(g, (Polygon, MultiPolygon))]
+        else:
+            geom_list = [merged]
+
+        return gpd.GeoDataFrame(geometry=geom_list, crs=None)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # FASE 11: POST-PROCESSING
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _postprocess_polygons(
+        self,
+        gdf_polygon: "geopandas.GeoDataFrame",
+        min_area_m2: float = 50.0,
+        simplify_tol_m: float = 0.5,
+    ) -> "geopandas.GeoDataFrame":
+        """
+        Post-process polygon jalan:
+          - Simplify geometri
+          - Filter area minimum
+        """
+        if len(gdf_polygon) == 0:
+            return gdf_polygon
+
+        import geopandas as gpd
+
+        # Simplify
+        gdf_polygon["geometry"] = gdf_polygon.geometry.simplify(
+            simplify_tol_m, preserve_topology=True
+        )
+
+        # Area filter (pakai CRS metric jika tersedia)
+        if gdf_polygon.crs and gdf_polygon.crs.is_geographic:
+            utm_crs  = gdf_polygon.estimate_utm_crs()
+            gdf_m    = gdf_polygon.to_crs(utm_crs)
+            areas_m2 = gdf_m.geometry.area
+        else:
+            areas_m2 = gdf_polygon.geometry.area
+
+        mask   = areas_m2 >= min_area_m2
+        result = gdf_polygon[mask].copy().reset_index(drop=True)
+        result["class"] = self.OBJECT_CLASS
+        return result
+
+    def _postprocess_lines(
+        self,
+        gdf_lines: "geopandas.GeoDataFrame",
+        min_length_m: float = 5.0,
+        simplify_tol_m: float = 0.5,
+    ) -> "geopandas.GeoDataFrame":
+        """
+        Post-process centerline jalan:
+          - Simplify
+          - Filter panjang minimum
+        """
+        if len(gdf_lines) == 0:
+            return gdf_lines
+
+        gdf_lines["geometry"] = gdf_lines.geometry.simplify(
+            simplify_tol_m, preserve_topology=True
+        )
+
+        if gdf_lines.crs and gdf_lines.crs.is_geographic:
+            utm_crs = gdf_lines.estimate_utm_crs()
+            gdf_m   = gdf_lines.to_crs(utm_crs)
+            lengths = gdf_m.geometry.length
+        else:
+            lengths = gdf_lines.geometry.length
+
+        mask   = lengths >= min_length_m
+        result = gdf_lines[mask].copy().reset_index(drop=True)
+        result["class"] = self.OBJECT_CLASS
+        return result
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PIPELINE UTAMA: PROCESS RASTER
+    # ══════════════════════════════════════════════════════════════════════════
 
     def process_raster(
         self,
         raster_path: str,
-        masks_dir: str,
+        output_dir: str,
         tile_size: int = 1024,
         overlap: int = 128,
-        min_area_m2: float = 30.0,
-        max_area_m2: float = 500000.0,
-        tile_progress_callback: Optional[Callable[[int, int], None]] = None,
-    ) -> List[Tuple[str, dict]]:
+        min_area_m2: float = 50.0,
+        prob_threshold: float = 0.45,
+        building_gdf: Optional["geopandas.GeoDataFrame"] = None,
+    ) -> Tuple["geopandas.GeoDataFrame", "geopandas.GeoDataFrame"]:
         """
-        Tile raster dan proses setiap tile untuk deteksi jalan.
+        Proses citra target secara tile-by-tile dan hasilkan polygon + centerline.
+
+        Args:
+            raster_path  : Path citra target (ECW / GeoTIFF)
+            output_dir   : Folder output untuk SHP
+            tile_size    : Ukuran tile dalam pixel
+            overlap      : Overlap antar tile dalam pixel
+            min_area_m2  : Luas minimum polygon jalan (m²)
+            prob_threshold: Threshold probability map [0–1]
 
         Returns:
-            List of (mask_tiff_path, tile_meta)
+            (gdf_polygon, gdf_centerline)
+            — masing-masing GeoDataFrame siap disimpan ke SHP
         """
+        import rasterio
+        import geopandas as gpd
+        from shapely.geometry import LineString
+
+        from core.objects.road_fingerprint import RoadFingerprintBuilder
         from core.tiling import tiles_generator
 
-        os.makedirs(masks_dir, exist_ok=True)
-        results = []
+        if self._fingerprint is None:
+            self.load_fingerprint()
 
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-        tiles_temp_dir = os.path.join(project_root, "temp", "tiles")
+        norm_params = self._fingerprint.get("normalization", {})
+        if not norm_params:
+            raise ValueError("Fingerprint tidak memiliki parameter normalisasi. "
+                             "Pastikan fingerprint dibuat dengan versi terbaru.")
 
-        self._log(f"Memulai tiling raster untuk deteksi jalan [{self.detection_mode}]: {Path(raster_path).name}")
+        self._log(f"Pipeline jalan dimulai: {Path(raster_path).name}")
+        self._progress(5, "Memulai deteksi jalan ...")
 
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Kumpulkan semua LineString dan Polygon dari tiap tile
+        all_lines   = []
+        all_polys   = []
+        tile_crs    = None
+
+        project_root   = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..")
+        )
+        tiles_temp_dir = os.path.join(project_root, "temp", "road_tiles")
+        os.makedirs(tiles_temp_dir, exist_ok=True)
+
+        # Hitung ukuran pixel dari raster
+        with rasterio.open(raster_path) as src:
+            transform_full = src.transform
+            pixel_size_m   = abs(transform_full.a)
+            tile_crs       = src.crs
+            if tile_crs and tile_crs.is_geographic:
+                # Konversi degrees → meters (approx 1° ≈ 111,320 m)
+                pixel_size_m = abs(transform_full.a) * 111_320
+
+        tile_count = 0
         for tile_path, tile_meta, idx, total in tiles_generator(
             raster_path=raster_path,
             tile_size=tile_size,
@@ -414,260 +720,146 @@ class RoadProcessor:
             enable_filtering=False,
         ):
             if self.is_cancelled():
-                self._log("Proses jalan dibatalkan.")
+                self._log("Dibatalkan.")
                 break
 
-            tile_name = Path(tile_path).stem
-            mask_path = os.path.join(masks_dir, f"mask_road_{tile_name}.tif")
+            pct = 10 + int(80 * idx / max(total, 1))
+            self._progress(pct, f"Tile {idx+1}/{total}: {Path(tile_path).name}")
+            self._log(f"[{idx+1}/{total}] Memproses tile: {Path(tile_path).stem}")
 
-            self._log(f"[{idx+1}/{total}] Tile jalan: {tile_name}")
-            if tile_progress_callback:
-                tile_progress_callback(idx + 1, total)
-
-            if os.path.isfile(mask_path):
-                os.remove(mask_path)
-
-            # Hitung batas area dalam piksel
-            transform = tile_meta["transform"]
-            res_x = abs(transform.a)
-            res_y = abs(transform.e)
-            pixel_area_m2 = res_x * res_y
-            min_px = min_area_m2 / pixel_area_m2 if pixel_area_m2 > 0 else 500.0
-            max_px = max_area_m2 / pixel_area_m2 if pixel_area_m2 > 0 else 5000000.0
-
-            if self.detection_mode == "automatic":
-                # Mode Otomatis: SAM generate() tanpa prompt
-                self._log("  -> Mode Otomatis (Grid Buta)")
-                success = self._process_tile_automatic(tile_path, mask_path)
-            elif self.detection_mode == "yolo":
-                # Mode YOLO
-                if self._yolo is None:
-                    self._log("  -> Gagal (YOLO tidak dimuat)")
-                    continue
-                yolo_results = self._yolo(tile_path, conf=0.25, verbose=False)
-                if len(yolo_results) > 0 and len(yolo_results[0].boxes) > 0:
-                    boxes = yolo_results[0].boxes.xyxy.cpu().numpy().tolist()
-                    self._log(f"  -> YOLO Deteksi: {len(boxes)} kotak")
-                    success = self.process_tile(tile_path, mask_path, boxes=boxes)
-                else:
-                    self._log("  -> YOLO Deteksi: 0 kotak")
-                    continue
-            else:
-                # Mode Pra-Deteksi Warna: OpenCV → titik prompt → SAM
-                point_coords, point_labels = self.detect_road_points(tile_path, min_px, max_px)
-                self._log(f"  -> Kandidat jalan: {len(point_coords)} titik")
-                if not point_coords:
-                    self._log("  -> Dilewati (tidak ada kandidat jalan)")
-                    continue
-                success = self.process_tile(tile_path, mask_path, point_coords=point_coords, point_labels=point_labels)
-
-            if success and os.path.isfile(mask_path):
-                results.append((mask_path, tile_meta))
-                self._log(f"  -> Berhasil: {Path(mask_path).name}")
-            else:
-                self._log("  -> Gagal atau dibatalkan")
-
-        # Bebaskan GPU
-        if self.device == "cuda":
             try:
-                import torch
-                torch.cuda.empty_cache()
-            except ImportError:
-                pass
-        gc.collect()
+                with rasterio.open(tile_path) as src:
+                    n_bands    = min(src.count, 3)
+                    img_raw    = src.read(list(range(1, n_bands + 1)))
+                    img_raw    = np.moveaxis(img_raw, 0, -1).astype(np.float32)
+                    tile_transform = src.transform
+                    tile_crs_local = src.crs
 
-        return results
+                if img_raw.shape[2] < 3:
+                    self._log(f"  ⚠ Tile hanya {img_raw.shape[2]} band, dilewati.")
+                    continue
 
-    def _process_tile_automatic(self, tile_path: str, output_mask_path: str) -> bool:
-        """Mode Otomatis: SAM generate() grid buta tanpa prompt pre-deteksi."""
-        if self.is_cancelled():
-            return False
-        if self._sam is None:
-            raise RuntimeError("Model belum dimuat.")
-        try:
-            self._sam.generate(tile_path, output=output_mask_path)
-            return os.path.isfile(output_mask_path)
-        except Exception as e:
-            self._log(f"Error generate otomatis {Path(tile_path).name}: {e}")
-            return False
+                # Pastikan norm_params punya key yang sesuai jumlah band
+                n_bands = img_raw.shape[2]
+                tile_norm = {
+                    f"band_{c}": norm_params.get(f"band_{c}", {"p_low": 0, "p_high": 255})
+                    for c in range(n_bands)
+                }
 
+                # Fase 5: Normalisasi + Scoring
+                img_norm = RoadFingerprintBuilder.normalize_image(img_raw, tile_norm)
+                prob_map = self._score_tile(img_norm)
 
-    # ──────────────────────────────────────────────────────────────
-    # Post-processing Khusus Jalan
-    # ──────────────────────────────────────────────────────────────
+                # [FIX 1] Rasterize building_gdf for this tile
+                building_mask_arr = None
+                if building_gdf is not None and len(building_gdf) > 0:
+                    from rasterio.features import geometry_mask
+                    shapes = [geom for geom in building_gdf.geometry if geom is not None]
+                    try:
+                        building_mask_arr = geometry_mask(
+                            shapes,
+                            transform=tile_transform,
+                            invert=True,  # True inside buildings
+                            out_shape=(img_raw.shape[0], img_raw.shape[1])
+                        )
+                    except Exception as e:
+                        self._log(f"  ⚠ Gagal rasterize building mask: {e}")
 
-    def postprocess(
-        self,
-        mask_results: List[Tuple[str, dict]],
-        original_raster_path: str,
-        min_area_m2: float = 30.0,
-        max_area_m2: float = 500000.0,
-        log_callback: Optional[Callable[[str], None]] = None,
-    ) -> "geopandas.GeoDataFrame":
-        """
-        Post-processing khusus untuk poligon jalan:
-        - Merge tile mask → vector
-        - Filter area (min luas jalan)
-        - Filter aspek rasio >= 1.5 (jalan bersifat memanjang)
-        - TIDAK ada regularisasi sudut 90° (jalan bisa melengkung)
-        - TIDAK ada filter vegetasi/bayangan
-        - Tambah kolom 'class' = 'Jalan'
-        """
-        import geopandas as gpd
-        import rasterio
+                # Fase 6: Masking
+                binary_mask = self._apply_mask(
+                    prob_map, img_norm, threshold=prob_threshold, building_mask=building_mask_arr
+                )
 
-        log = log_callback or (lambda x: None)
+                road_px_count = (binary_mask > 0).sum()
+                self._log(f"  Prob map → {road_px_count:,} piksel kandidat jalan")
 
-        log("=== POST-PROCESSING JALAN ===")
+                if road_px_count < _MIN_BLOB_AREA_PX:
+                    self._log("  → Tidak ada jalan ditemukan di tile ini, dilewati.")
+                    continue
 
-        # 1. Merge tile masks → polygons
-        log("Menggabungkan mask tile jalan...")
-        all_gdfs = []
-        for mask_path, tile_meta in mask_results:
-            if not os.path.isfile(mask_path):
-                continue
-            try:
-                gdf_tile = self._mask_to_polygons(mask_path)
-                if len(gdf_tile) > 0:
-                    all_gdfs.append(gdf_tile)
+                # Fase 7: Morphology
+                cleaned_mask = self._morphology(binary_mask)
+                if (cleaned_mask > 0).sum() < _MIN_BLOB_AREA_PX:
+                    self._log("  → Setelah morphology, tidak ada piksel tersisa.")
+                    continue
+
+                # Fase 8: Skeletonization
+                skeleton, dist_tf = self._skeletonize(cleaned_mask)
+
+                if skeleton.sum() == 0:
+                    self._log("  → Skeleton kosong, dilewati.")
+                    continue
+
+                # Fase 9: Vectorize
+                lines, widths = self._skeleton_to_linestrings(
+                    skeleton, dist_tf, tile_transform, pixel_size_m=pixel_size_m
+                )
+                self._log(f"  → {len(lines)} segmen centerline")
+
+                if not lines:
+                    continue
+
+                # Fase 10: Adaptive Buffer
+                gdf_buf = self._adaptive_buffer(lines, widths, pixel_size_m)
+                if gdf_buf.crs is None and tile_crs_local:
+                    gdf_buf = gdf_buf.set_crs(tile_crs_local)
+
+                all_polys.extend(gdf_buf.geometry.tolist())
+                all_lines.extend(lines)
+                tile_count += 1
+
             except Exception as e:
-                log(f"  Gagal vektorisasi {Path(mask_path).name}: {e}")
-
-        if not all_gdfs:
-            log("Tidak ada poligon jalan yang berhasil diekstrak.")
-            with rasterio.open(original_raster_path) as src:
-                return gpd.GeoDataFrame(geometry=[], crs=src.crs)
-
-        merged = gpd.pd.concat(all_gdfs, ignore_index=True)
-        gdf = gpd.GeoDataFrame(merged, geometry="geometry", crs=all_gdfs[0].crs)
-        log(f"Total poligon jalan awal: {len(gdf)}")
-
-        # 2. Deduplikasi overlap antar tile
-        gdf = self._deduplicate(gdf, log)
-
-        # 3. Filter area
-        gdf = self._filter_area(gdf, min_area_m2, max_area_m2, log)
-
-        # 4. Filter aspek rasio — jalan harus memanjang (>= 1.5)
-        gdf = self._filter_aspect_ratio(gdf, min_ratio=1.5, log_callback=log)
-
-        # 5. Tambahkan kolom class
-        gdf["class"] = self.OBJECT_CLASS
-
-        log(f"=== POST-PROCESSING JALAN SELESAI: {len(gdf)} poligon ===")
-        return gdf.reset_index(drop=True)
-
-    # ──────────────────────────────────────────────────────────────
-    # Helper Methods
-    # ──────────────────────────────────────────────────────────────
-
-    def _mask_to_polygons(self, mask_path: str) -> "geopandas.GeoDataFrame":
-        """Konversi raster mask ke vector polygon."""
-        import rasterio
-        from rasterio.features import shapes
-        import geopandas as gpd
-        from shapely.geometry import shape
-        import numpy as np
-
-        with rasterio.open(mask_path) as src:
-            data = src.read(1)
-            transform = src.transform
-            crs = src.crs
-
-        unique_vals = np.unique(data)
-        geoms = []
-        for val in unique_vals:
-            if val == 0:
-                continue
-            instance_mask = (data == val).astype(np.uint8)
-            for geom_dict, v in shapes(instance_mask, mask=instance_mask, transform=transform):
-                if v == 1:
-                    geom = shape(geom_dict)
-                    if geom.area > 0:
-                        geoms.append(geom)
-
-        if not geoms:
-            return gpd.GeoDataFrame(geometry=[], crs=crs)
-        return gpd.GeoDataFrame(geometry=geoms, crs=crs)
-
-    def _deduplicate(self, gdf, log):
-        """Hapus duplikat dari overlap tile (IoU > 0.5)."""
-        gdf = gdf.copy()
-        gdf["geometry"] = gdf.geometry.buffer(0)
-        keep = [True] * len(gdf)
-        geoms = list(gdf.geometry)
-        for i in range(len(geoms)):
-            if not keep[i]:
-                continue
-            for j in range(i + 1, len(geoms)):
-                if not keep[j]:
-                    continue
+                self._log(f"  ⚠ Error pada tile {Path(tile_path).stem}: {e}")
+                import traceback
+                self._log(traceback.format_exc())
+            finally:
+                # Bersihkan tile temp
                 try:
-                    inter = geoms[i].intersection(geoms[j]).area
-                    if inter == 0:
-                        continue
-                    union = geoms[i].union(geoms[j]).area
-                    iou = inter / union if union > 0 else 0
-                    if iou > 0.5:
-                        keep[j] = False
+                    if os.path.exists(tile_path):
+                        os.remove(tile_path)
                 except Exception:
                     pass
-        result = gdf[[v for v in keep]].copy() if False else gdf.iloc[[k for k, v in enumerate(keep) if v]].copy()
-        log(f"Poligon jalan setelah deduplication: {len(result)}")
-        return result.reset_index(drop=True)
 
-    def _filter_area(self, gdf, min_area_m2, max_area_m2, log):
-        """Filter berdasarkan luas dalam m²."""
-        if len(gdf) == 0:
-            return gdf
-        if gdf.crs and gdf.crs.is_geographic:
-            utm_crs = gdf.estimate_utm_crs()
-            gdf_metric = gdf.to_crs(utm_crs)
+        self._log(f"Selesai: {tile_count} tile berhasil diproses.")
+
+        if not all_polys and not all_lines:
+            self._log("⚠ Tidak ada jalan terdeteksi di seluruh citra.")
+            empty_gdf = gpd.GeoDataFrame(geometry=[], crs=tile_crs)
+            return empty_gdf, empty_gdf
+
+        # ── Fase 11: Post-processing ──────────────────────────────────────────
+        self._progress(92, "Post-processing polygon & centerline jalan ...")
+
+        # Gabung semua polygon dari semua tile → union → split
+        from shapely.ops import unary_union
+        from shapely.geometry import MultiPolygon, Polygon
+
+        if all_polys:
+            merged_poly = unary_union(all_polys)
+            if isinstance(merged_poly, Polygon):
+                poly_list = [merged_poly]
+            elif isinstance(merged_poly, MultiPolygon):
+                poly_list = list(merged_poly.geoms)
+            else:
+                poly_list = [g for g in merged_poly.geoms
+                             if isinstance(g, (Polygon, MultiPolygon))]
+            gdf_polygon = gpd.GeoDataFrame(geometry=poly_list, crs=tile_crs)
         else:
-            gdf_metric = gdf.copy()
-        areas = gdf_metric.geometry.area
-        mask = (areas >= min_area_m2) & (areas <= max_area_m2)
-        result = gdf[mask].copy()
-        log(f"Filter area jalan ({min_area_m2}–{max_area_m2} m²): {len(gdf)} -> {len(result)}")
-        return result.reset_index(drop=True)
+            gdf_polygon = gpd.GeoDataFrame(geometry=[], crs=tile_crs)
 
-    def _filter_aspect_ratio(self, gdf, min_ratio: float = 1.5, log_callback=None):
-        """
-        Filter jalan berdasarkan aspek rasio MINIMUM.
-        Berbeda dari filter bangunan yang pakai maksimum — jalan justru harus memanjang.
-        """
-        log = log_callback or (lambda x: None)
-        if len(gdf) == 0:
-            return gdf
-
-        def get_aspect(geom):
-            try:
-                mbr = geom.minimum_rotated_rectangle
-                if mbr is None or mbr.is_empty:
-                    return 1.0
-                coords = list(mbr.exterior.coords)
-                edges = []
-                for i in range(len(coords) - 1):
-                    dx = coords[i+1][0] - coords[i][0]
-                    dy = coords[i+1][1] - coords[i][1]
-                    edges.append((dx**2 + dy**2) ** 0.5)
-                if len(edges) < 2:
-                    return 1.0
-                s1, s2 = edges[0], edges[1]
-                return max(s1, s2) / max(min(s1, s2), 1e-9)
-            except Exception:
-                return 1.0
-
-        ratios = gdf.geometry.apply(get_aspect)
-        # Jalan: aspek rasio >= min_ratio ATAU area yang sangat besar (persimpangan)
-        if gdf.crs and gdf.crs.is_geographic:
-            utm_crs = gdf.estimate_utm_crs()
-            gdf_metric = gdf.to_crs(utm_crs)
+        if all_lines:
+            gdf_centerline = gpd.GeoDataFrame(geometry=all_lines, crs=tile_crs)
         else:
-            gdf_metric = gdf.copy()
-        large_area = gdf_metric.geometry.area >= 500.0   # persimpangan >= 500 m²
+            gdf_centerline = gpd.GeoDataFrame(geometry=[], crs=tile_crs)
 
-        mask = (ratios >= min_ratio) | large_area
-        result = gdf[mask].copy()
-        log(f"Filter aspek rasio jalan (>={min_ratio} atau area>=500m²): {len(gdf)} -> {len(result)}")
-        return result.reset_index(drop=True)
+        gdf_polygon    = self._postprocess_polygons(gdf_polygon, min_area_m2)
+        gdf_centerline = self._postprocess_lines(gdf_centerline)
+
+        self._log(
+            f"=== SELESAI: {len(gdf_polygon)} polygon jalan, "
+            f"{len(gdf_centerline)} segmen centerline ==="
+        )
+        self._progress(100, f"Jalan selesai: {len(gdf_polygon)} polygon")
+        gc.collect()
+
+        return gdf_polygon, gdf_centerline
