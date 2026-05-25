@@ -42,7 +42,7 @@ class SAMGeoApp(ctk.CTk):
     """Main application window."""
 
     APP_TITLE = "SAM-Geo Multi-Object Digitizer"
-    APP_VERSION = "1.3"
+    APP_VERSION = "1.4"
     MIN_WIDTH = 1200
     MIN_HEIGHT = 720
 
@@ -163,7 +163,7 @@ class SAMGeoApp(ctk.CTk):
 
     def _check_environment(self):
         """Verify required packages and GPU availability at startup."""
-        self.log_panel.log("=== SAM-Geo Multi-Object Digitizer v1.3 ===", "system")
+        self.log_panel.log("=== SAM-Geo Multi-Object Digitizer v1.4 ===", "system")
         self.log_panel.log("Memeriksa environment...", "system")
 
         missing = []

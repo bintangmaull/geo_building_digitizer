@@ -414,80 +414,53 @@ def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr):
     from shapely.validation import make_valid
     import math
 
-    # A. Calculate the True Architectural Angle using Robust Edge Histogram
-    # We simplify the mask heavily (1.0 meter tolerance) just for angle calculation
-    # to completely flatten out SAM's pixel staircases, revealing the true macroscopic walls.
+    # A. Calculate the True Architectural Angle using Robust Edge Scoring
+    # We simplify the mask to flatten out pixel noise.
     angle = 0.0
     try:
-        angle_simplify_tol = 1.0 if actual_simplify_tol > 0.1 else (1.0 / 111320)
+        angle_simplify_tol = 0.8 if actual_simplify_tol > 0.1 else (0.8 / 111320)
         pre_simplified = geom.simplify(angle_simplify_tol, preserve_topology=True)
         coords = list(pre_simplified.exterior.coords)
-        buckets = {}
         
+        edges = []
         for i in range(len(coords) - 1):
             p1 = coords[i]
             p2 = coords[i+1]
             dx = p2[0] - p1[0]
             dy = p2[1] - p1[1]
             length = math.hypot(dx, dy)
-            if length < angle_simplify_tol: continue # Ignore noise
+            if length < 1e-5: continue
             
             deg = math.degrees(math.atan2(dy, dx)) % 90.0
+            edges.append((deg, length))
             
-            # Distribute length across adjacent bins (smoothing)
-            for offset in range(-3, 4):
-                bin_idx = int(round(deg + offset)) % 90
-                # Give highest weight to the exact center, lower to the edges
-                weight = length * (4 - abs(offset))
-                buckets[bin_idx] = buckets.get(bin_idx, 0) + weight
-                
-        if buckets:
-            best_bin = 0
-            max_val = -1
-            for b_idx, val in buckets.items():
-                if val > max_val:
-                    max_val = val
-                    best_bin = b_idx
-                    
-            # REFINE THE ANGLE to sub-degree precision
-            exact_angle_sum = 0.0
-            exact_weight_sum = 0.0
-            
-            for i in range(len(coords) - 1):
-                p1 = coords[i]
-                p2 = coords[i+1]
-                dx = p2[0] - p1[0]
-                dy = p2[1] - p1[1]
-                length = math.hypot(dx, dy)
-                if length < angle_simplify_tol: continue
-                
-                deg = math.degrees(math.atan2(dy, dx)) % 90.0
-                diff = abs(deg - best_bin)
-                if diff > 45:
-                    diff = 90 - diff
-                    
-                if diff <= 4.0:
-                    avg_deg = deg
-                    if best_bin < 10 and deg > 80:
-                        avg_deg = deg - 90
-                    elif best_bin > 80 and deg < 10:
-                        avg_deg = deg + 90
-                        
-                    exact_angle_sum += avg_deg * length
-                    exact_weight_sum += length
-                    
-            if exact_weight_sum > 0:
-                hist_angle_deg = (exact_angle_sum / exact_weight_sum) % 90.0
-            else:
-                hist_angle_deg = best_bin
-
-            angle = math.radians(hist_angle_deg)
-        else:
+        if not edges:
             raise ValueError("No valid edges found")
+            
+        best_angle_deg = 0.0
+        max_score = -1.0
+        
+        # Test every edge's angle to see which one explains the most perimeter
+        for target_deg, _ in edges:
+            score = 0.0
+            for deg, length in edges:
+                diff = abs(deg - target_deg)
+                if diff > 45.0:
+                    diff = 90.0 - diff
+                
+                # If an edge is within 5 degrees of the target angle (or its orthogonal), it contributes to the score
+                if diff <= 5.0:
+                    score += length * math.cos(math.radians(diff))
+                    
+            if score > max_score:
+                max_score = score
+                best_angle_deg = target_deg
+
+        angle = math.radians(best_angle_deg)
             
     except Exception as e:
         print(f"DEBUG RTA: Exception in angle calc: {e}")
-        # Fallback to MBR if histogram fails
+        # Fallback to MBR if anything fails
         mbr_coords = list(mbr.exterior.coords)
         max_len = -1.0
         for i in range(4):
