@@ -414,58 +414,33 @@ def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr):
     from shapely.validation import make_valid
     import math
 
-    # A. Calculate the True Architectural Angle
-    # MBR is highly unstable for L-shapes, T-shapes, and buildings with tree protrusions.
-    # We simplify the mask to remove pixel staircases, then find the dominant angle using an edge-length histogram.
+    # A. Calculate the True Architectural Angle using Robust Edge Histogram
+    # We simplify the mask heavily (1.0 meter tolerance) just for angle calculation
+    # to completely flatten out SAM's pixel staircases, revealing the true macroscopic walls.
     angle = 0.0
     try:
-        angle_simplify_tol = 0.2 if actual_simplify_tol > 0.1 else (0.2 / 111320)
+        angle_simplify_tol = 1.0 if actual_simplify_tol > 0.1 else (1.0 / 111320)
         pre_simplified = geom.simplify(angle_simplify_tol, preserve_topology=True)
         coords = list(pre_simplified.exterior.coords)
         buckets = {}
-        bounds = pre_simplified.bounds
+        
         for i in range(len(coords) - 1):
             p1 = coords[i]
             p2 = coords[i+1]
             dx = p2[0] - p1[0]
             dy = p2[1] - p1[1]
             length = math.hypot(dx, dy)
-            if length < angle_simplify_tol: continue # Ignore tiny artifact edges
+            if length < angle_simplify_tol: continue # Ignore noise
             
             deg = math.degrees(math.atan2(dy, dx)) % 90.0
-            
-            # Penalize perfect H/V edges because they are highly likely to be artificial YOLO crop lines.
-            is_perfect_hv = abs(dx) < 1e-8 or abs(dy) < 1e-8
-            
-            # HEAVY PENALTY for bounding box edges (these are 100% crop lines or image boundaries)
-            is_on_boundary = False
-            p1_left = abs(p1[0] - bounds[0]) < 1.0
-            p2_left = abs(p2[0] - bounds[0]) < 1.0
-            p1_right = abs(p1[0] - bounds[2]) < 1.0
-            p2_right = abs(p2[0] - bounds[2]) < 1.0
-            
-            p1_bottom = abs(p1[1] - bounds[1]) < 1.0
-            p2_bottom = abs(p2[1] - bounds[1]) < 1.0
-            p1_top = abs(p1[1] - bounds[3]) < 1.0
-            p2_top = abs(p2[1] - bounds[3]) < 1.0
-            
-            if (p1_left and p2_left) or (p1_right and p2_right) or \
-               (p1_bottom and p2_bottom) or (p1_top and p2_top):
-                is_on_boundary = True
-                
-            weight_multiplier = 1.0
-            if is_on_boundary:
-                weight_multiplier = 0.05
-            elif is_perfect_hv:
-                weight_multiplier = 0.5
             
             # Distribute length across adjacent bins (smoothing)
             for offset in range(-3, 4):
                 bin_idx = int(round(deg + offset)) % 90
                 # Give highest weight to the exact center, lower to the edges
-                weight = length * (4 - abs(offset)) * weight_multiplier
+                weight = length * (4 - abs(offset))
                 buckets[bin_idx] = buckets.get(bin_idx, 0) + weight
-            
+                
         if buckets:
             best_bin = 0
             max_val = -1
@@ -498,27 +473,8 @@ def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr):
                     elif best_bin > 80 and deg < 10:
                         avg_deg = deg + 90
                         
-                    is_perfect_hv = abs(dx) < 1e-8 or abs(dy) < 1e-8
-                    is_on_boundary = False
-                    p1_left = abs(p1[0] - bounds[0]) < 1.0
-                    p2_left = abs(p2[0] - bounds[0]) < 1.0
-                    p1_right = abs(p1[0] - bounds[2]) < 1.0
-                    p2_right = abs(p2[0] - bounds[2]) < 1.0
-                    p1_bottom = abs(p1[1] - bounds[1]) < 1.0
-                    p2_bottom = abs(p2[1] - bounds[1]) < 1.0
-                    p1_top = abs(p1[1] - bounds[3]) < 1.0
-                    p2_top = abs(p2[1] - bounds[3]) < 1.0
-                    if (p1_left and p2_left) or (p1_right and p2_right) or \
-                       (p1_bottom and p2_bottom) or (p1_top and p2_top):
-                        is_on_boundary = True
-                            
-                    wm = 1.0
-                    if is_on_boundary: wm = 0.05
-                    elif is_perfect_hv: wm = 0.5
-                    
-                    w = length * wm
-                    exact_angle_sum += avg_deg * w
-                    exact_weight_sum += w
+                    exact_angle_sum += avg_deg * length
+                    exact_weight_sum += length
                     
             if exact_weight_sum > 0:
                 hist_angle_deg = (exact_angle_sum / exact_weight_sum) % 90.0
@@ -531,7 +487,7 @@ def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr):
             
     except Exception as e:
         print(f"DEBUG RTA: Exception in angle calc: {e}")
-        # Fallback to MBR if anything fails
+        # Fallback to MBR if histogram fails
         mbr_coords = list(mbr.exterior.coords)
         max_len = -1.0
         for i in range(4):
@@ -716,8 +672,8 @@ def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr):
     if not orthogonalized_geom.is_empty and orthogonalized_geom.is_valid:
         bounds = orthogonalized_geom.bounds
         mbr_area = (bounds[2] - bounds[0]) * (bounds[3] - bounds[1])
-        # A chamfered rectangle has area ~90% of its MBR. L-shapes are < 75%.
-        if mbr_area > 0 and (orthogonalized_geom.area / mbr_area) > 0.82:
+        # A chamfered rectangle has area ~95% of its MBR.
+        if mbr_area > 0 and (orthogonalized_geom.area / mbr_area) > 0.92:
             new_coords = [
                 (bounds[0], bounds[1]),
                 (bounds[2], bounds[1]),
@@ -791,10 +747,8 @@ def orthogonalize_polygon(geom, angle_tolerance_deg: float = 25.0, simplify_tol:
         baseline_simplify = max(simplify_tol, 0.25)
         
         if strict_straight:
-            # Force high tolerance to ignore tree indentations and "tabrak lurus"
-            # We ONLY increase simplify tolerance. We DO NOT increase closing_radius 
-            # because a large round buffer destroys 90-degree corners and skews the MBR angle!
-            baseline_simplify = max(baseline_simplify, 2.5)
+            # Prevent excessive simplification that destroys architectural details
+            baseline_simplify = max(baseline_simplify, 0.5)
             
         actual_simplify_tol   = baseline_simplify
         actual_closing_radius = closing_radius
@@ -833,7 +787,7 @@ def orthogonalize_polygon(geom, angle_tolerance_deg: float = 25.0, simplify_tol:
 
         # Strict threshold: only rectangularize near-perfect boxes,
         # let L/U/compound shapes proceed to RTA orthogonalization.
-        if iou >= 0.87 and solidity >= 0.93:
+        if iou >= 0.90 and solidity >= 0.95:
             return mbr
 
         # ── Step C: Simplify + RTA Orthogonalization ────────────────────────────
@@ -924,8 +878,8 @@ def regularize_polygons(
                         tree_pixels = (greenness > greenness_threshold).sum()
                         tree_ratio = tree_pixels / valid.sum()
                         
-                        # Jika lebih dari 5% area buffer adalah pohon, paksa jadi kotak lurus
-                        if tree_ratio > 0.05:
+                        # Jika lebih dari 20% area buffer adalah pohon, beri perlakuan khusus
+                        if tree_ratio > 0.20:
                             strict_straight = True
             except Exception:
                 pass
