@@ -21,6 +21,7 @@ def generate_yolo_dataset(
     chip_size: int = 640,
     target_gsd: float = 0.15,
     target_class_name: str = "bangunan",
+    mode: str = "bbox",  # 'bbox' or 'segmentation'
     log_callback: Optional[Callable[[str], None]] = None,
     progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> bool:
@@ -93,46 +94,39 @@ def generate_yolo_dataset(
             log("🎯 Menghitung kotak batas spasial...")
             progress(20, "Mengekstrak ubin gambar YOLO...")
 
-            visited = set()
-            grid_size = int(chip_size * 0.75 / scale)
+            grid_size = int(chip_size / scale)
+            step = int(grid_size * 0.75) # 25% overlap
 
             chip_count = 0
-            total_buildings = len(gdf)
-            log(f"🎯 Total objek {target_class_name}: {total_buildings:,}")
+            
+            # Tentukan area pencarian berdasarkan bounding box keseluruhan Shapefile
+            minx, miny, maxx, maxy = gdf.total_bounds
+            r1, c1 = src.index(minx, maxy) # Top Left
+            r2, c2 = src.index(maxx, miny) # Bottom Right
+            
+            start_row = max(0, int(min(r1, r2)))
+            end_row   = min(height, int(max(r1, r2)))
+            start_col = max(0, int(min(c1, c2)))
+            end_col   = min(width, int(max(c1, c2)))
+            
+            # Buat daftar koordinat grid
+            grid_windows = []
+            for r in range(start_row, end_row, step):
+                for c in range(start_col, end_col, step):
+                    grid_windows.append((r, c))
+                    
+            total_windows = len(grid_windows)
+            log(f"🎯 Memindai {total_windows:,} area grid untuk mencari {target_class_name}...")
 
-            for idx, geom in enumerate(gdf.geometry):
-                if geom is None or not geom.is_valid:
-                    continue
+            for idx, (row, col) in enumerate(grid_windows):
+                if idx % max(1, total_windows // 20) == 0:
+                    pct = 20.0 + (idx / total_windows) * 50.0
+                    progress(pct, f"Mengekstrak dataset YOLO ({idx}/{total_windows})...")
 
-                if idx % max(1, total_buildings // 20) == 0:
-                    pct = 20.0 + (idx / total_buildings) * 50.0
-                    progress(pct, f"Mengekstrak dataset YOLO ({idx}/{total_buildings})...")
+                if row + grid_size > height or col + grid_size > width:
+                    continue # Skip grid yang keluar dari batas gambar
 
-                centroid = geom.centroid
-                cx_geo, cy_geo = centroid.x, centroid.y
-
-                row, col = src.index(cx_geo, cy_geo)
-
-                if not (0 <= row < height and 0 <= col < width):
-                    continue
-
-                grid_row = int(row // grid_size) * grid_size
-                grid_col = int(col // grid_size) * grid_size
-                grid_key = (grid_row, grid_col)
-
-                if grid_key in visited:
-                    continue
-                visited.add(grid_key)
-
-                raw_w = int(chip_size / scale)
-                
-                offset_row = grid_row - (raw_w - grid_size) // 2
-                offset_col = grid_col - (raw_w - grid_size) // 2
-
-                if offset_row < 0 or offset_col < 0 or offset_row + raw_w > height or offset_col + raw_w > width:
-                    continue
-
-                window = rasterio.windows.Window(offset_col, offset_row, raw_w, raw_w)
+                window = rasterio.windows.Window(col, row, grid_size, grid_size)
                 win_transform = rasterio.windows.transform(window, transform)
                 
                 win_box = box(*rasterio.windows.bounds(window, transform))
@@ -170,41 +164,59 @@ def generate_yolo_dataset(
                     minx, miny, maxx, maxy = intersection.bounds
                     
                     # Convert geographic coordinates back to local window pixel coordinates
-                    # Note: win_transform.row(x,y) gives (row, col) from (x,y)
-                    r1, c1 = rasterio.transform.rowcol(win_transform, minx, miny) # top left
-                    r2, c2 = rasterio.transform.rowcol(win_transform, maxx, maxy) # bottom right
-                    
-                    # Sort coordinates since y-axis is flipped
-                    px_minx = min(c1, c2)
-                    px_maxx = max(c1, c2)
-                    px_miny = min(r1, r2)
-                    px_maxy = max(r1, r2)
-                    
-                    # Apply scale
-                    px_minx *= scale
-                    px_maxx *= scale
-                    px_miny *= scale
-                    px_maxy *= scale
-                    
-                    # Clamp to image size
-                    px_minx = max(0, min(px_minx, chip_size))
-                    px_maxx = max(0, min(px_maxx, chip_size))
-                    px_miny = max(0, min(px_miny, chip_size))
-                    px_maxy = max(0, min(px_maxy, chip_size))
-                    
-                    box_w = px_maxx - px_minx
-                    box_h = px_maxy - px_miny
-                    
-                    if box_w < 5 or box_h < 5:
-                        continue # Ignore extremely tiny slivers
+                    if mode == "segmentation":
+                        # YOLO Segmentation format: class x1 y1 x2 y2 ... xn yn (normalized)
+                        if intersection.geom_type == 'Polygon':
+                            polys = [intersection]
+                        elif intersection.geom_type == 'MultiPolygon':
+                            polys = list(intersection.geoms)
+                        else:
+                            continue
+                            
+                        for poly in polys:
+                            coords = list(poly.exterior.coords)
+                            if len(coords) < 3:
+                                continue
+                                
+                            norm_coords = []
+                            for pt in coords:
+                                lon, lat = pt[0], pt[1]
+                                r, c = rasterio.transform.rowcol(win_transform, lon, lat)
+                                px_x = max(0, min(c * scale, chip_size))
+                                px_y = max(0, min(r * scale, chip_size))
+                                norm_coords.append(f"{px_x / chip_size:.6f} {px_y / chip_size:.6f}")
+                                
+                            if len(norm_coords) > 2:
+                                yolo_labels.append(f"0 {' '.join(norm_coords)}")
+                    else:
+                        # Standard YOLO Bounding Box format
+                        minx, miny, maxx, maxy = intersection.bounds
                         
-                    # YOLO format: class x_center y_center width height (normalized)
-                    x_center = (px_minx + box_w / 2.0) / chip_size
-                    y_center = (px_miny + box_h / 2.0) / chip_size
-                    norm_w = box_w / chip_size
-                    norm_h = box_h / chip_size
-                    
-                    yolo_labels.append(f"0 {x_center:.6f} {y_center:.6f} {norm_w:.6f} {norm_h:.6f}")
+                        r1, c1 = rasterio.transform.rowcol(win_transform, minx, miny) # top left
+                        r2, c2 = rasterio.transform.rowcol(win_transform, maxx, maxy) # bottom right
+                        
+                        px_minx = min(c1, c2) * scale
+                        px_maxx = max(c1, c2) * scale
+                        px_miny = min(r1, r2) * scale
+                        px_maxy = max(r1, r2) * scale
+                        
+                        px_minx = max(0, min(px_minx, chip_size))
+                        px_maxx = max(0, min(px_maxx, chip_size))
+                        px_miny = max(0, min(px_miny, chip_size))
+                        px_maxy = max(0, min(px_maxy, chip_size))
+                        
+                        box_w = px_maxx - px_minx
+                        box_h = px_maxy - px_miny
+                        
+                        if box_w < 5 or box_h < 5:
+                            continue # Ignore extremely tiny slivers
+                            
+                        x_center = (px_minx + box_w / 2.0) / chip_size
+                        y_center = (px_miny + box_h / 2.0) / chip_size
+                        norm_w = box_w / chip_size
+                        norm_h = box_h / chip_size
+                        
+                        yolo_labels.append(f"0 {x_center:.6f} {y_center:.6f} {norm_w:.6f} {norm_h:.6f}")
 
                 if not yolo_labels:
                     continue # Skip saving image if no valid labels

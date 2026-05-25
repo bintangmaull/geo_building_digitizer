@@ -627,7 +627,7 @@ class SAMProcessor:
                     verbose=False,
                     imgsz=max(img.shape[0], img.shape[1]),
                     conf=0.15,
-                    iou=0.45,
+                    iou=0.6,
                     max_det=3000
                 )
                 boxes = yolo_results[0].boxes.xyxy.cpu().numpy()
@@ -676,8 +676,8 @@ class SAMProcessor:
                     boxes_tensor = torch.tensor([d["global_box"] for d in all_yolo_detections], dtype=torch.float32)
                     scores_tensor = torch.tensor([d["conf"] for d in all_yolo_detections], dtype=torch.float32)
                     
-                    # 1. Standard NMS
-                    keep_indices = torchvision.ops.nms(boxes_tensor, scores_tensor, 0.3).tolist()
+                    # 1. Standard NMS (increased threshold from 0.3 to 0.5 for dense buildings)
+                    keep_indices = torchvision.ops.nms(boxes_tensor, scores_tensor, 0.5).tolist()
                     
                     # 2. IoM NMS (Intersection over Minimum Area)
                     # We want to keep the most confident predictions.
@@ -707,7 +707,7 @@ class SAMProcessor:
                             inter = w * h
                             
                             min_area = min(areaA, areaB)
-                            if min_area > 0 and (inter / min_area) > 0.60:
+                            if min_area > 0 and (inter / min_area) > 0.85:
                                 keep = False
                                 break
                                 

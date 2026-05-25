@@ -29,6 +29,36 @@ def train_yolo_model(
 
         try:
             from ultralytics import YOLO
+            import ultralytics.nn.tasks as tasks
+            try:
+                from core.models.uav_yolov12_modules import PConv, SKNet
+                tasks.PConv = PConv
+                tasks.SKNet = SKNet
+                
+                # Monkey-patch parse_model agar mengenali PConv dan SKNet sebagai base_modules
+                # sehingga `c1` (in_channels) dilempar otomatis ke parameter mereka.
+                original_parse_model = tasks.parse_model
+                def custom_parse_model(d, ch, verbose=True):
+                    # We inject our modules into the parsing loop by temporarily wrapping the modules
+                    # Actually, we can just intercept the created layers!
+                    pass # We will do a better interception below
+                    
+                # A safer monkey-patch: replace parse_model entirely for this run!
+                import inspect
+                source = inspect.getsource(original_parse_model)
+                # Sisipkan PConv dan SKNet ke dalam set base_modules di kode sumbernya!
+                source = source.replace('base_modules = frozenset(', 'base_modules = frozenset({PConv, SKNet} | ')
+                source = source.replace(')\n    repeat_modules', ')\n    repeat_modules')
+                
+                # Execute the modified source
+                exec_globals = tasks.__dict__.copy()
+                exec(source, exec_globals)
+                tasks.parse_model = exec_globals['parse_model']
+                
+            except Exception as e:
+                log(f"⚠️ Peringatan: Patch modul kustom UAV-YOLO gagal ({e})")
+                import traceback
+                log(traceback.format_exc())
         except ImportError:
             log("❌ Error: library ultralytics belum terinstal. Jalankan pip install ultralytics")
             return False

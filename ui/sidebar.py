@@ -1352,10 +1352,12 @@ class Sidebar(ctk.CTkScrollableFrame):
             self.road_ref_shp_var.set(path)
 
     def _browse_road_fp_json(self):
-        """Browse for existing fingerprint JSON."""
+        """Browse for existing fingerprint JSON or YOLO pt."""
         path = filedialog.askopenfilename(
-            title="Pilih File Road Fingerprint (.json)",
+            title="Pilih File Road Fingerprint (.json) atau YOLO (.pt)",
             filetypes=[
+                ("Model / Fingerprint", "*.pt *.json"),
+                ("YOLO Model", "*.pt"),
                 ("JSON Files", "*.json"),
                 ("All Files", "*.*"),
             ]

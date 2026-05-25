@@ -402,6 +402,9 @@ class SAMGeoApp(ctk.CTk):
         try:
             # 1. Dataset Generation
             self._train_yolo_progress(0, f"Mempersiapkan dataset YOLO untuk {target_obj}...")
+            
+            gen_mode = "segmentation" if target_obj_lower == "jalan" else "bbox"
+            
             success = generate_yolo_dataset(
                 geotiff_path=geotiff_path,
                 shp_path=shp_path,
@@ -409,6 +412,7 @@ class SAMGeoApp(ctk.CTk):
                 chip_size=640,
                 target_gsd=0.15,
                 target_class_name=target_obj_lower,
+                mode=gen_mode,
                 log_callback=self._log,
                 progress_callback=self._train_yolo_progress,
             )
@@ -422,7 +426,11 @@ class SAMGeoApp(ctk.CTk):
 
             # Extract base model name from current UI selection if possible, otherwise default to yolov8n.pt
             base_model = self.sidebar.yolo_var.get().split()[0]
-            if base_model == "yolo_bangunan_lokal.pt":
+            
+            if target_obj_lower == "jalan":
+                base_model = os.path.join(ROOT, "core", "models", "uav-yolov12-seg.yaml")
+                self._log("🛣️ Menggunakan arsitektur kustom UAV-YOLO12-Seg untuk jalan", "system")
+            elif base_model == "yolo_bangunan_lokal.pt":
                 custom_model_path = os.path.join(ROOT, "models", "yolo_bangunan_lokal.pt")
                 if os.path.exists(custom_model_path):
                     base_model = custom_model_path
