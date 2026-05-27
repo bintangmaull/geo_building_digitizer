@@ -120,7 +120,10 @@ def train_yolo_model(
             name="yolo_train_run",
             exist_ok=True, # overwrite previous run
             device="0", # use GPU 0, will fallback to cpu if fail usually but ultralytics handles it
-            workers=0 # Fix for Windows WinError 1455 (pagefile too small)
+            workers=0, # Fix for Windows WinError 1455 (pagefile too small)
+            lr0=0.001, # Learning rate lebih kecil untuk fine-tuning agar tidak merusak bobot lama
+            lrf=0.01,  # Final learning rate
+            patience=25 # Early stopping jika model makin bodoh
         )
         
         output_model_path = os.path.join(models_dir, output_model_name)

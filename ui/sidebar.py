@@ -332,6 +332,29 @@ class Sidebar(ctk.CTkScrollableFrame):
         tile_seg.grid(row=row, column=1, sticky="ew", padx=(4, 12))
         row += 1
 
+        # Overlap Tile
+        ctk.CTkLabel(
+            self, text="Overlap Tile:",
+            font=ctk.CTkFont(size=11), text_color="#CBD5E1", anchor="w",
+        ).grid(row=row, column=0, sticky="w", padx=12, pady=(4, 0))
+
+        self.overlap_var = tk.StringVar(value="25% (Aman)")
+        self.overlap_menu = ctk.CTkOptionMenu(
+            self,
+            values=["12.5% (Cepat)", "25% (Aman)", "50% (Sangat Aman)"],
+            variable=self.overlap_var,
+            font=ctk.CTkFont(size=11),
+            height=28,
+            fg_color="#1E293B",
+            button_color="#334155",
+            button_hover_color="#475569",
+            dropdown_fg_color="#1E293B",
+            dropdown_hover_color="#334155",
+            text_color="#E2E8F0",
+        )
+        self.overlap_menu.grid(row=row, column=1, sticky="ew", padx=(4, 12), pady=(4, 0))
+        row += 1
+
         # Luas minimum
         ctk.CTkLabel(
             self, text="Luas Min (m²):",
@@ -461,6 +484,21 @@ class Sidebar(ctk.CTkScrollableFrame):
         )
         self.simplify_var.grid(row=row, column=1, sticky="ew", padx=(4, 12), pady=(4, 0))
         self.simplify_var.insert(0, "0.75")
+        row += 1
+
+        # YOLO Confidence
+        ctk.CTkLabel(
+            self, text="YOLO Confidence (%):",
+            font=ctk.CTkFont(size=11), text_color="#CBD5E1", anchor="w",
+        ).grid(row=row, column=0, sticky="w", padx=12, pady=(4, 0))
+
+        self.yolo_conf_var = ctk.CTkEntry(
+            self, placeholder_text="15", width=80, height=24,
+            font=ctk.CTkFont(size=11),
+            fg_color="#1E293B", border_color="#334155", text_color="#E2E8F0",
+        )
+        self.yolo_conf_var.grid(row=row, column=1, sticky="ew", padx=(4, 12), pady=(4, 0))
+        self.yolo_conf_var.insert(0, "15")
         row += 1
 
         # ── 5b. Objek Digitasi ─────────────────────────────
@@ -962,6 +1000,33 @@ class Sidebar(ctk.CTkScrollableFrame):
         # ── 6c. Training Model YOLO ──────────────────
         row += 1; self._divider(row); row += 1
         self._section_label("🎯  TRAINING MODEL YOLO", row); row += 1
+
+        self.lbl_train_yolo_base = ctk.CTkLabel(
+            self,
+            text="Base Model (Mulai dari mana):",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#CBD5E1",
+            anchor="w",
+        )
+        self.lbl_train_yolo_base.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0))
+        row += 1
+        
+        self.train_yolo_base_var = tk.StringVar(value="Otomatis (Lanjutkan jika ada)")
+        self.train_yolo_base_menu = ctk.CTkOptionMenu(
+            self,
+            values=["Otomatis (Lanjutkan jika ada)"] + yolo_values,
+            variable=self.train_yolo_base_var,
+            font=ctk.CTkFont(size=11),
+            height=28,
+            fg_color="#1E293B",
+            button_color="#334155",
+            button_hover_color="#475569",
+            dropdown_fg_color="#1E293B",
+            dropdown_hover_color="#334155",
+            text_color="#E2E8F0",
+        )
+        self.train_yolo_base_menu.grid(row=row, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 4))
+        row += 1
         
         self.lbl_train_yolo_geotiff = ctk.CTkLabel(
             self,
@@ -997,28 +1062,28 @@ class Sidebar(ctk.CTkScrollableFrame):
         self.btn_browse_train_yolo_geotiff.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=(0, 4))
         row += 1
         
-        self.lbl_train_yolo_shp = ctk.CTkLabel(
+        self.lbl_train_yolo_shp_b = ctk.CTkLabel(
             self,
-            text="2. File Digitasi Bangunan (Shapefile .shp):",
+            text="2. Shapefile Bangunan (Opsional):",
             font=ctk.CTkFont(size=10, weight="bold"),
             text_color="#CBD5E1",
             anchor="w",
         )
-        self.lbl_train_yolo_shp.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0))
+        self.lbl_train_yolo_shp_b.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0))
         row += 1
         
-        self.entry_train_yolo_shp = ctk.CTkEntry(
+        self.entry_train_yolo_shp_b = ctk.CTkEntry(
             self,
-            placeholder_text="Path polygon .shp...",
+            placeholder_text="Path polygon bangunan .shp...",
             font=ctk.CTkFont(size=11),
             height=30,
             fg_color="#0F172A",
             border_color="#334155",
             text_color="#E2E8F0",
         )
-        self.entry_train_yolo_shp.grid(row=row, column=0, sticky="ew", padx=(12, 4), pady=(0, 4))
+        self.entry_train_yolo_shp_b.grid(row=row, column=0, sticky="ew", padx=(12, 4), pady=(0, 4))
         
-        self.btn_browse_train_yolo_shp = ctk.CTkButton(
+        self.btn_browse_train_yolo_shp_b = ctk.CTkButton(
             self,
             text="📂",
             width=36,
@@ -1026,36 +1091,77 @@ class Sidebar(ctk.CTkScrollableFrame):
             corner_radius=6,
             fg_color="#334155",
             hover_color="#475569",
-            command=self._browse_train_yolo_shp,
+            command=lambda: self._browse_train_yolo_shp_multi(self.entry_train_yolo_shp_b, "Bangunan"),
         )
-        self.btn_browse_train_yolo_shp.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=(0, 4))
+        self.btn_browse_train_yolo_shp_b.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=(0, 4))
         row += 1
-        
-        self.lbl_train_yolo_target = ctk.CTkLabel(
+
+        self.lbl_train_yolo_shp_j = ctk.CTkLabel(
             self,
-            text="3. Target Objek:",
+            text="3. Shapefile Jalan (Opsional):",
             font=ctk.CTkFont(size=10, weight="bold"),
             text_color="#CBD5E1",
             anchor="w",
         )
-        self.lbl_train_yolo_target.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0))
+        self.lbl_train_yolo_shp_j.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0))
         row += 1
-
-        self.train_yolo_target_var = tk.StringVar(value="Bangunan")
-        self.train_yolo_target_menu = ctk.CTkOptionMenu(
+        
+        self.entry_train_yolo_shp_j = ctk.CTkEntry(
             self,
-            values=["Bangunan", "Jalan", "Badan Air"],
-            variable=self.train_yolo_target_var,
+            placeholder_text="Path polygon jalan .shp...",
             font=ctk.CTkFont(size=11),
             height=30,
             fg_color="#0F172A",
-            button_color="#334155",
-            button_hover_color="#475569",
-            dropdown_fg_color="#1E293B",
-            dropdown_hover_color="#334155",
+            border_color="#334155",
             text_color="#E2E8F0",
         )
-        self.train_yolo_target_menu.grid(row=row, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 10))
+        self.entry_train_yolo_shp_j.grid(row=row, column=0, sticky="ew", padx=(12, 4), pady=(0, 4))
+        
+        self.btn_browse_train_yolo_shp_j = ctk.CTkButton(
+            self,
+            text="📂",
+            width=36,
+            height=30,
+            corner_radius=6,
+            fg_color="#334155",
+            hover_color="#475569",
+            command=lambda: self._browse_train_yolo_shp_multi(self.entry_train_yolo_shp_j, "Jalan"),
+        )
+        self.btn_browse_train_yolo_shp_j.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=(0, 4))
+        row += 1
+        
+        self.lbl_train_yolo_shp_l = ctk.CTkLabel(
+            self,
+            text="4. Shapefile Lainnya (Opsional):",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#CBD5E1",
+            anchor="w",
+        )
+        self.lbl_train_yolo_shp_l.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0))
+        row += 1
+        
+        self.entry_train_yolo_shp_l = ctk.CTkEntry(
+            self,
+            placeholder_text="Path polygon lainnya .shp...",
+            font=ctk.CTkFont(size=11),
+            height=30,
+            fg_color="#0F172A",
+            border_color="#334155",
+            text_color="#E2E8F0",
+        )
+        self.entry_train_yolo_shp_l.grid(row=row, column=0, sticky="ew", padx=(12, 4), pady=(0, 10))
+        
+        self.btn_browse_train_yolo_shp_l = ctk.CTkButton(
+            self,
+            text="📂",
+            width=36,
+            height=30,
+            corner_radius=6,
+            fg_color="#334155",
+            hover_color="#475569",
+            command=lambda: self._browse_train_yolo_shp_multi(self.entry_train_yolo_shp_l, "Lainnya"),
+        )
+        self.btn_browse_train_yolo_shp_l.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=(0, 10))
         row += 1
         
         self.btn_train_yolo_run = ctk.CTkButton(
@@ -1238,6 +1344,12 @@ class Sidebar(ctk.CTkScrollableFrame):
             simplify_tol = float(self.simplify_var.get())
         except Exception:
             simplify_tol = 0.75
+            
+        try:
+            yolo_conf = float(self.yolo_conf_var.get()) / 100.0
+            yolo_conf = max(0.01, min(0.99, yolo_conf))
+        except Exception:
+            yolo_conf = 0.15
 
         # Parse points_per_side from selection string
         pts_str = self.pts_var.get()
@@ -1246,6 +1358,14 @@ class Sidebar(ctk.CTkScrollableFrame):
             pts_val = 32
         elif "64" in pts_str:
             pts_val = 64
+            
+        # Parse overlap string
+        overlap_str = self.overlap_var.get()
+        overlap_ratio = 0.25
+        if "12.5" in overlap_str:
+            overlap_ratio = 0.125
+        elif "50" in overlap_str:
+            overlap_ratio = 0.5
 
         # ── Resolve road fingerprint path ───────────────────────
         fp_source = self.road_fp_source_var.get()
@@ -1263,9 +1383,11 @@ class Sidebar(ctk.CTkScrollableFrame):
             "model_name": self.model_var.get(),
             "mode": self.mode_var.get(),
             "yolo_model": self.yolo_var.get(),
+            "yolo_conf": yolo_conf,
             "show_yolo_preview": self.show_yolo_preview_var.get(),
             "enable_tile_filtering": self.filter_empty_var.get(),
             "tile_size": int(self.tile_var.get()),
+            "overlap_ratio": overlap_ratio,
             "min_area_m2": min_area,
             "max_area_m2": max_area,
             "points_per_side": pts_val,
@@ -1524,37 +1646,57 @@ class Sidebar(ctk.CTkScrollableFrame):
             self.entry_train_yolo_geotiff.delete(0, tk.END)
             self.entry_train_yolo_geotiff.insert(0, path)
             
-    def _browse_train_yolo_shp(self):
+    def _browse_train_yolo_shp_multi(self, entry_widget, target_name):
         path = filedialog.askopenfilename(
-            title="Pilih Shapefile Bangunan untuk Training YOLO",
+            title=f"Pilih Shapefile {target_name} untuk Training YOLO",
             filetypes=[
                 ("Shapefile Files", "*.shp"),
                 ("All Files", "*.*"),
             ]
         )
         if path:
-            self.entry_train_yolo_shp.delete(0, tk.END)
-            self.entry_train_yolo_shp.insert(0, path)
+            entry_widget.delete(0, tk.END)
+            entry_widget.insert(0, path)
 
     def _on_train_yolo_clicked(self):
         geotiff = self.entry_train_yolo_geotiff.get().strip()
-        shp = self.entry_train_yolo_shp.get().strip()
+        shp_b = self.entry_train_yolo_shp_b.get().strip()
+        shp_j = self.entry_train_yolo_shp_j.get().strip()
+        shp_l = self.entry_train_yolo_shp_l.get().strip()
         
-        if not geotiff or not shp:
-            messagebox.showwarning("File Belum Lengkap", "Silakan pilih kedua file (Citra GeoTIFF & Shapefile) terlebih dahulu.")
+        if not geotiff:
+            messagebox.showwarning("File Belum Lengkap", "Silakan pilih Citra GeoTIFF terlebih dahulu.")
+            return
+            
+        if not shp_b and not shp_j and not shp_l:
+            messagebox.showwarning("File Belum Lengkap", "Silakan isi minimal satu Shapefile (Bangunan, Jalan, atau Lainnya).")
             return
             
         if not os.path.exists(geotiff):
             messagebox.showerror("File Tidak Ditemukan", f"Citra GeoTIFF tidak ditemukan di path:\n{geotiff}")
             return
             
-        if not os.path.exists(shp):
-            messagebox.showerror("File Tidak Ditemukan", f"Shapefile tidak ditemukan di path:\n{shp}")
-            return
+        shp_paths = {}
+        if shp_b:
+            if not os.path.exists(shp_b):
+                messagebox.showerror("File Tidak Ditemukan", f"Shapefile Bangunan tidak ditemukan di path:\n{shp_b}")
+                return
+            shp_paths["bangunan"] = shp_b
             
-        target_obj = self.train_yolo_target_var.get().strip()
+        if shp_j:
+            if not os.path.exists(shp_j):
+                messagebox.showerror("File Tidak Ditemukan", f"Shapefile Jalan tidak ditemukan di path:\n{shp_j}")
+                return
+            shp_paths["jalan"] = shp_j
+            
+        if shp_l:
+            if not os.path.exists(shp_l):
+                messagebox.showerror("File Tidak Ditemukan", f"Shapefile Lainnya tidak ditemukan di path:\n{shp_l}")
+                return
+            shp_paths["lainnya"] = shp_l
+            
         self.btn_train_yolo_run.configure(state="disabled", text="⏳  Training YOLO...")
-        self.on_train_yolo(geotiff, shp, target_obj)
+        self.on_train_yolo(geotiff, shp_paths)
 
     def set_training_yolo_progress(self, percent: float, status_msg: str):
         """Update progress bar and status text for YOLO training."""

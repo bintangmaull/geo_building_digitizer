@@ -284,7 +284,7 @@ def _run_segformer_pipeline(
             raster_path=raster_path,
             enabled_classes=enabled_classes,
             tile_size=tile_size,
-            overlap=tile_size // 8,
+            overlap=int(tile_size * params.get("overlap_ratio", 0.125)),
             min_area_m2=min_areas,
             max_area_m2=max_areas,
             use_feature_refinement=params.get("use_feature_refinement", True),
@@ -376,7 +376,7 @@ def _process_single_object(
             raster_path=raster_path,
             output_dir=masks_dir,  # Hanya untuk temporary temp/masks_road
             tile_size=tile_size,
-            overlap=tile_size // 8,
+            overlap=int(tile_size * params.get("overlap_ratio", 0.125)),
             min_area_m2=min_area_m2,
             building_gdf=building_gdf,
         )
@@ -433,7 +433,7 @@ def _process_single_object(
                 raster_path=raster_path,
                 masks_dir=masks_dir,
                 tile_size=tile_size,
-                overlap=tile_size // 8,
+                overlap=int(tile_size * params.get("overlap_ratio", 0.125)),
                 min_area_m2=min_area_m2,
                 max_area_m2=max_area_m2,
             )

@@ -77,6 +77,7 @@ class SAMProcessor:
         points_per_side: int = 48,
         mode: str = "Otomatis (Grid Buta)",
         yolo_model_name: str = "yolov8n.pt",
+        yolo_conf: float = 0.15,
         log_callback: Optional[Callable[[str], None]] = None,
         progress_callback: Optional[Callable[[int, str], None]] = None,
     ):
@@ -84,6 +85,7 @@ class SAMProcessor:
         self.models_dir = os.path.abspath(models_dir)
         self.points_per_side = points_per_side
         self.yolo_model_name = yolo_model_name
+        self.yolo_conf = yolo_conf
         
         if "YOLO" in mode:
             self.mode = "yolo"
@@ -186,14 +188,22 @@ class SAMProcessor:
                 from ultralytics import YOLO
                 # Extract actual model filename
                 exact_yolo = self.yolo_model_name.split()[0]
-                if exact_yolo == "yolo_bangunan_lokal.pt":
-                    yolo_path = os.path.join(self.models_dir, exact_yolo)
+                possible_path = os.path.join(self.models_dir, exact_yolo)
+                if os.path.exists(possible_path):
+                    yolo_path = possible_path
                 else:
                     yolo_path = exact_yolo
+                import ultralytics.nn.tasks as tasks
+                try:
+                    from core.models.uav_yolov12_modules import PConv, SKNet
+                    tasks.PConv = PConv
+                    tasks.SKNet = SKNet
+                except ImportError:
+                    pass
                 self._log(f"Memuat model YOLO: {yolo_path}")
                 self._yolo = YOLO(yolo_path)
             except Exception as e:
-                self._log(f"⚠️ Gagal memuat YOLO, dialihkan ke grid mode: {e}", "warning")
+                self._log(f"⚠️ Gagal memuat YOLO, dialihkan ke grid mode: {e}")
                 self.mode = "automatic"
 
         # ── SAM2 branch ──────────────────────────────────────────────
@@ -626,7 +636,7 @@ class SAMProcessor:
                     img, 
                     verbose=False,
                     imgsz=max(img.shape[0], img.shape[1]),
-                    conf=0.15,
+                    conf=self.yolo_conf,
                     iou=0.6,
                     max_det=3000
                 )

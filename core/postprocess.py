@@ -688,18 +688,27 @@ def orthogonalize_polygon(geom, angle_tolerance_deg: float = 25.0, simplify_tol:
 
     Fallback – Shape-preserving simplified geometry for complex buildings, or MBR for simple boxes.
     """
-    from shapely.geometry import Polygon, MultiPolygon
+    from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
     from shapely.validation import make_valid
     import math
 
     if geom is None or geom.is_empty:
         return geom
 
-    # Handle multi-polygons
-    if isinstance(geom, MultiPolygon):
-        parts = [orthogonalize_polygon(p, angle_tolerance_deg, simplify_tol, closing_radius, strict_straight)
-                 for p in geom.geoms]
-        parts = [p for p in parts if p and not p.is_empty]
+    # Handle multi-polygons or geometry collections
+    if isinstance(geom, (MultiPolygon, GeometryCollection)):
+        parts = []
+        for p in geom.geoms:
+            if isinstance(p, Polygon):
+                res = orthogonalize_polygon(p, angle_tolerance_deg, simplify_tol, closing_radius, strict_straight)
+                if res and not res.is_empty:
+                    if isinstance(res, Polygon):
+                        parts.append(res)
+                    elif isinstance(res, MultiPolygon):
+                        parts.extend(list(res.geoms))
+                    elif isinstance(res, GeometryCollection):
+                        parts.extend([g for g in res.geoms if isinstance(g, Polygon)])
+        
         if not parts:
             return geom
         return parts[0] if len(parts) == 1 else MultiPolygon(parts)
@@ -976,12 +985,12 @@ def filter_non_building_colors(
 
 def merge_overlapping_fragments(
     gdf: "geopandas.GeoDataFrame",
-    threshold: float = 0.15,
+    threshold: float = 0.12,  # Diturunkan sedikit dari 0.15 agar lebih sensitif
     log_callback=None,
 ) -> "geopandas.GeoDataFrame":
     """
-    Merge polygons that overlap significantly (e.g. YOLO duplicate detections for the same complex roof).
-    Adjacent distinct buildings (e.g. terraced houses) will not be merged because their intersection area is ~0.
+    Merge polygons that overlap significantly or touch with a long shared boundary.
+    This heals buildings that were cut by tile boundaries or YOLO bounding boxes.
     """
     import geopandas as gpd
     from shapely.ops import unary_union
@@ -990,7 +999,17 @@ def merge_overlapping_fragments(
     if len(gdf) <= 1:
         return gdf
 
-    log("Menggabungkan fragmen bangunan yang tumpang tindih...")
+    log("Menggabungkan fragmen bangunan yang tumpang tindih atau terpotong...")
+    
+    # Gunakan buffer kecil (sekitar 0.5 meter) untuk mendeteksi poligon yang terpotong 
+    # lurus dan hanya bersentuhan (gap 0 piksel).
+    is_geographic = False
+    if gdf.crs and gdf.crs.is_geographic:
+        is_geographic = True
+    
+    # 0.5 meter dikonversi ke derajat (pendekatan kasar di khatulistiwa)
+    buf_dist = 0.5 / 111320.0 if is_geographic else 0.5
+
     geoms = list(gdf.geometry)
 
     changed = True
@@ -1007,27 +1026,51 @@ def merge_overlapping_fragments(
                 g_i = g_i.buffer(0)
             
             b1 = g_i.bounds
+            # Perlebar bounding box check agar poligon yang bersebelahan lolos filter
+            b1_exp = (b1[0] - buf_dist, b1[1] - buf_dist, b1[2] + buf_dist, b1[3] + buf_dist)
 
             for j in range(i + 1, len(geoms)):
                 if j in skip_indices: continue
                 
                 g_j = geoms[j]
                 b2 = g_j.bounds
+                
                 # Fast bounding box check
-                if b1[2] < b2[0] or b1[0] > b2[2] or b1[3] < b2[1] or b1[1] > b2[3]:
+                if b1_exp[2] < b2[0] or b1_exp[0] > b2[2] or b1_exp[3] < b2[1] or b1_exp[1] > b2[3]:
                     continue
 
                 if not g_j.is_valid:
                     g_j = g_j.buffer(0)
 
+                min_area = min(g_i.area, g_j.area)
+                if min_area <= 0:
+                    continue
+
+                merged = False
+                
+                # 1. Cek overlap asli (intersection nyata)
                 inter = g_i.intersection(g_j)
-                if not inter.is_empty:
-                    min_area = min(g_i.area, g_j.area)
-                    if min_area > 0 and (inter.area / min_area) > threshold:
-                        g_i = unary_union([g_i, g_j]).buffer(0)
-                        skip_indices.add(j)
-                        changed = True
-                        b1 = g_i.bounds # Update bounds after merge
+                if not inter.is_empty and (inter.area / min_area) > threshold:
+                    merged = True
+                else:
+                    # 2. Cek overlap semu (dengan buffer) untuk kasus poligon terpotong rapi yang hanya bersentuhan
+                    buf_i = g_i.buffer(buf_dist)
+                    buf_j = g_j.buffer(buf_dist)
+                    inter_buf = buf_i.intersection(buf_j)
+                    
+                    # Logika: Jika mereka berbagi sisi yang panjang (relatif terhadap ukuran poligon yang lebih kecil),
+                    # maka area inter_buf akan membesar. Ini membedakan "rumah deret yang bersentuhan sedikit" 
+                    # dari "satu rumah yang terbelah dua".
+                    if not inter_buf.is_empty and (inter_buf.area / min_area) > threshold:
+                        merged = True
+
+                if merged:
+                    g_i = unary_union([g_i, g_j]).buffer(0)
+                    skip_indices.add(j)
+                    changed = True
+                    # Update bounds untuk loop selanjutnya
+                    b1 = g_i.bounds
+                    b1_exp = (b1[0] - buf_dist, b1[1] - buf_dist, b1[2] + buf_dist, b1[3] + buf_dist)
 
             new_geoms.append(g_i)
 
@@ -1192,7 +1235,7 @@ def run_postprocess_pipeline(
     # 4c. Merge overlapping fragments (duplicate detections of the same building)
     # MUST be done before regularization so the regularizer sees the full complex roof!
     progress(90, "Menggabungkan fragmen bangunan yang tumpang tindih...")
-    gdf = merge_overlapping_fragments(gdf, threshold=0.15, log_callback=log)
+    gdf = merge_overlapping_fragments(gdf, threshold=0.12, log_callback=log)
 
     # 5. Regularization
     if enable_regularization:

@@ -371,14 +371,14 @@ class SAMGeoApp(ctk.CTk):
             self._log(traceback.format_exc(), "error")
             self.after(0, lambda: self.sidebar.set_training_idle("Error fatal training!", False))
 
-    def _on_train_yolo(self, geotiff_path: str, shp_path: str, target_obj: str = "Bangunan"):
+    def _on_train_yolo(self, geotiff_path: str, shp_paths: dict):
         """Starts the YOLO AI model training process in a background thread."""
         self.log_panel.reset()
         self._log("=== MEMULAI PROSES TRAINING YOLO ===", "system")
         
         train_yolo_thread = threading.Thread(
             target=self._run_training_yolo_pipeline,
-            args=(geotiff_path, shp_path, target_obj),
+            args=(geotiff_path, shp_paths),
             daemon=True,
         )
         train_yolo_thread.start()
@@ -389,29 +389,34 @@ class SAMGeoApp(ctk.CTk):
         if message:
             self._log(f"⚡ [YOLO Progress] {message}", "info")
 
-    def _run_training_yolo_pipeline(self, geotiff_path: str, shp_path: str, target_obj: str = "Bangunan"):
+    def _run_training_yolo_pipeline(self, geotiff_path: str, shp_paths: dict):
         """Runs YOLO dataset generation and training in background."""
         import shutil
         from core.yolo_dataset_generator import generate_yolo_dataset
         from train_yolo import train_yolo_model
 
         dataset_dir = os.path.join(ROOT, "dataset_yolo")
-        target_obj_lower = target_obj.lower().replace("badan ", "").replace(" ", "_")
+        
+        if len(shp_paths) > 1:
+            target_obj_lower = "multiclass"
+        else:
+            target_obj_lower = list(shp_paths.keys())[0].lower().replace(" ", "_")
+            
         output_model_name = f"yolo_{target_obj_lower}_lokal.pt"
         
         try:
             # 1. Dataset Generation
-            self._train_yolo_progress(0, f"Mempersiapkan dataset YOLO untuk {target_obj}...")
+            self._train_yolo_progress(0, f"Mempersiapkan dataset YOLO untuk {target_obj_lower}...")
             
-            gen_mode = "segmentation" if target_obj_lower == "jalan" else "bbox"
+            # Use segmentation mode if "jalan" is present, otherwise "bbox". Wait, we changed the plan to use segmentation if any class is present (as polygon is standard) or keep it dynamic. Let's just use segmentation for multi-class or jalan.
+            gen_mode = "segmentation" if ("jalan" in shp_paths or len(shp_paths) > 1) else "bbox"
             
             success = generate_yolo_dataset(
                 geotiff_path=geotiff_path,
-                shp_path=shp_path,
+                shp_paths=shp_paths,
                 output_dir=dataset_dir,
                 chip_size=640,
                 target_gsd=0.15,
-                target_class_name=target_obj_lower,
                 mode=gen_mode,
                 log_callback=self._log,
                 progress_callback=self._train_yolo_progress,
@@ -424,25 +429,40 @@ class SAMGeoApp(ctk.CTk):
             # 2. YOLO fine-tuning
             self._train_yolo_progress(70, "Menghubungkan ke GPU & Memulai training YOLO...")
 
-            # Extract base model name from current UI selection if possible, otherwise default to yolov8n.pt
-            base_model = self.sidebar.yolo_var.get().split()[0]
+            # Extract base model name from current UI selection if possible
+            selected_base = getattr(self.sidebar, "train_yolo_base_var", self.sidebar.yolo_var).get()
             
-            if target_obj_lower == "jalan":
-                custom_model_path = os.path.join(ROOT, "models", output_model_name)
-                if os.path.exists(custom_model_path):
-                    base_model = custom_model_path
-                    self._log(f"🔄 Melanjutkan training (fine-tuning) dari model kustom UAV-YOLO12-Seg yang sudah ada: {custom_model_path}", "system")
+            if selected_base.startswith("Otomatis"):
+                # Logika otomatis (auto-continue jika model target sudah ada)
+                if "jalan" in shp_paths:
+                    custom_model_path = os.path.join(ROOT, "models", output_model_name)
+                    if os.path.exists(custom_model_path):
+                        base_model = custom_model_path
+                        self._log(f"🔄 Melanjutkan training (fine-tuning) dari model kustom yang sudah ada: {custom_model_path}", "system")
+                    else:
+                        base_model = os.path.join(ROOT, "core", "models", "uav-yolov12-seg.yaml")
+                        self._log("🛣️ Menggunakan arsitektur kustom UAV-YOLO12-Seg", "system")
                 else:
-                    base_model = os.path.join(ROOT, "core", "models", "uav-yolov12-seg.yaml")
-                    self._log("🛣️ Menggunakan arsitektur kustom UAV-YOLO12-Seg untuk jalan", "system")
-            elif base_model == "yolo_bangunan_lokal.pt":
-                custom_model_path = os.path.join(ROOT, "models", "yolo_bangunan_lokal.pt")
-                if os.path.exists(custom_model_path):
-                    base_model = custom_model_path
-                    self._log(f"🔄 Melanjutkan training (fine-tuning) dari model kustom YOLO yang sudah ada: {custom_model_path}", "system")
+                    custom_model_path = os.path.join(ROOT, "models", output_model_name)
+                    if os.path.exists(custom_model_path):
+                        base_model = custom_model_path
+                        self._log(f"🔄 Melanjutkan training (fine-tuning) dari model kustom YOLO yang sudah ada: {custom_model_path}", "system")
+                    else:
+                        base_model = "yolo12n.pt"
+                        self._log(f"⚠️ Model kustom tidak ditemukan, memulai training baru dengan base model: {base_model}", "warning")
+            else:
+                # User memilih model spesifik
+                base_model = selected_base.split()[0]
+                if base_model.startswith("yolo_") and base_model.endswith(".pt"):
+                    custom_model_path = os.path.join(ROOT, "models", base_model)
+                    if os.path.exists(custom_model_path):
+                        base_model = custom_model_path
+                        self._log(f"🔄 Menggunakan base model kustom pilihan Anda: {custom_model_path}", "system")
+                    else:
+                        self._log(f"⚠️ Model kustom {base_model} tidak ditemukan, jatuh kembali ke yolo12n.pt", "warning")
+                        base_model = "yolo12n.pt"
                 else:
-                    base_model = "yolo12n.pt"
-                    self._log(f"⚠️ Model kustom tidak ditemukan, memulai training baru dengan base model: {base_model}", "warning")
+                    self._log(f"🆕 Menggunakan base model standar: {base_model}", "system")
 
             success = train_yolo_model(
                 dataset_dir=dataset_dir,
@@ -611,6 +631,7 @@ class SAMGeoApp(ctk.CTk):
                 points_per_side=params.get("points_per_side", 48),
                 mode=params.get("mode", "Otomatis (Grid Buta)"),
                 yolo_model_name=params.get("yolo_model", "yolo12n.pt (YOLO12 Nano - Terbaru)"),
+                yolo_conf=params.get("yolo_conf", 0.15),
                 log_callback=self._log,
                 progress_callback=self._progress,
             )
@@ -627,11 +648,13 @@ class SAMGeoApp(ctk.CTk):
             self._progress(40, "Memulai segmentasi SAM...")
             self._log(f"🚀 Memulai segmentasi pada {total_tiles} tile...", "sam")
 
+            overlap_ratio = params.get("overlap_ratio", 0.125)
+            
             mask_results, yolo_boxes = self._processor.process_raster(
                 raster_path=raster_path,
                 masks_dir=masks_dir,
                 tile_size=tile_size,
-                overlap=tile_size // 8,
+                overlap=int(tile_size * overlap_ratio),
                 enable_filtering=params.get("enable_tile_filtering", True),
                 min_area_m2=min_area,
                 max_area_m2=max_area,
