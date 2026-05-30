@@ -62,7 +62,7 @@ def train_road_unet(
     log(f"Device: {device}")
     if device == "cuda":
         gpu_name = torch.cuda.get_device_name(0)
-        vram_mb = torch.cuda.get_device_properties(0).total_mem / 1024**2
+        vram_mb = torch.cuda.get_device_properties(0).total_memory / 1024**2
         log(f"GPU: {gpu_name} ({vram_mb:.0f} MB VRAM)")
 
     if output_model_path is None:

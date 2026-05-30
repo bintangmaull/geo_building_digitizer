@@ -85,7 +85,7 @@ class RoadProcessor:
                 import torch
                 from core.objects.road_unet_model import create_road_unet
                 
-                checkpoint = torch.load(self.fingerprint_path, map_location='cpu')
+                checkpoint = torch.load(self.fingerprint_path, map_location='cpu', weights_only=False)
                 encoder_name = checkpoint.get('encoder_name', 'resnet34')
                 
                 self._unet = create_road_unet(encoder_name=encoder_name, encoder_weights=None)
