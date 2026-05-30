@@ -405,23 +405,40 @@ def filter_shadows(
 # STEP 5: Polygon Regularization (Corner Snapping)
 # ──────────────────────────────────────────────
 
-def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr):
+def compute_dominant_angle(geom, simplify_tol=None):
     """
-    Internal helper: Rotate-to-Align Orthogonalization.
-    Rotates the polygon to its dominant axis, simplifies, snaps orthogonal corners, rotates back.
+    Compute the dominant architectural angle of a polygon using Robust Edge Scoring.
+    Returns the angle in radians, normalized to [-pi/4, pi/4].
+    
+    This is extracted so it can be pre-computed BEFORE merging tile fragments,
+    preventing tile-boundary seam edges from corrupting the angle calculation.
     """
-    from shapely.geometry import Polygon
-    from shapely.validation import make_valid
     import math
+    from shapely.geometry import Polygon
 
-    # A. Calculate the True Architectural Angle using Robust Edge Scoring
-    # We simplify the mask to flatten out pixel noise.
-    angle = 0.0
+    if geom is None or geom.is_empty:
+        return 0.0
+
+    # Determine simplify tolerance for angle calculation
+    if simplify_tol is None:
+        # Auto-detect: geographic vs projected
+        try:
+            c = geom.centroid
+            if abs(c.x) <= 180.0 and abs(c.y) <= 90.0:
+                minx, miny, maxx, maxy = geom.bounds
+                if (maxx - minx) < 0.1 and (maxy - miny) < 0.1:
+                    simplify_tol = 0.8 / 111320
+                else:
+                    simplify_tol = 0.8
+            else:
+                simplify_tol = 0.8
+        except Exception:
+            simplify_tol = 0.8
+
     try:
-        angle_simplify_tol = 0.8 if actual_simplify_tol > 0.1 else (0.8 / 111320)
-        pre_simplified = geom.simplify(angle_simplify_tol, preserve_topology=True)
+        pre_simplified = geom.simplify(simplify_tol, preserve_topology=True)
         coords = list(pre_simplified.exterior.coords)
-        
+
         edges = []
         for i in range(len(coords) - 1):
             p1 = coords[i]
@@ -429,52 +446,133 @@ def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr):
             dx = p2[0] - p1[0]
             dy = p2[1] - p1[1]
             length = math.hypot(dx, dy)
-            if length < 1e-5: continue
-            
+            if length < 1e-5:
+                continue
             deg = math.degrees(math.atan2(dy, dx)) % 90.0
             edges.append((deg, length))
-            
+
         if not edges:
-            raise ValueError("No valid edges found")
-            
+            return 0.0
+
         best_angle_deg = 0.0
         max_score = -1.0
-        
-        # Test every edge's angle to see which one explains the most perimeter
+
         for target_deg, _ in edges:
             score = 0.0
             for deg, length in edges:
                 diff = abs(deg - target_deg)
                 if diff > 45.0:
                     diff = 90.0 - diff
-                
-                # If an edge is within 5 degrees of the target angle (or its orthogonal), it contributes to the score
                 if diff <= 5.0:
                     score += length * math.cos(math.radians(diff))
-                    
             if score > max_score:
                 max_score = score
                 best_angle_deg = target_deg
 
         angle = math.radians(best_angle_deg)
-            
-    except Exception as e:
-        print(f"DEBUG RTA: Exception in angle calc: {e}")
-        # Fallback to MBR if anything fails
-        mbr_coords = list(mbr.exterior.coords)
-        max_len = -1.0
-        for i in range(4):
-            dx = mbr_coords[i+1][0] - mbr_coords[i][0]
-            dy = mbr_coords[i+1][1] - mbr_coords[i][1]
-            length = math.hypot(dx, dy)
-            if length > max_len:
-                max_len = length
-                angle = math.atan2(dy, dx)
-                
+
+    except Exception:
+        # Fallback to MBR longest edge
+        try:
+            mbr = geom.minimum_rotated_rectangle
+            mbr_coords = list(mbr.exterior.coords)
+            max_len = -1.0
+            angle = 0.0
+            for i in range(4):
+                dx = mbr_coords[i+1][0] - mbr_coords[i][0]
+                dy = mbr_coords[i+1][1] - mbr_coords[i][1]
+                length = math.hypot(dx, dy)
+                if length > max_len:
+                    max_len = length
+                    angle = math.atan2(dy, dx)
+        except Exception:
+            return 0.0
+
     # Normalize angle to -45..45 degrees
     angle = angle % (math.pi / 2)
     if angle > math.pi / 4:
         angle -= math.pi / 2
+
+    return angle
+
+
+def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr, forced_angle=None):
+    """
+    Internal helper: Rotate-to-Align Orthogonalization.
+    Rotates the polygon to its dominant axis, simplifies, snaps orthogonal corners, rotates back.
+    
+    If forced_angle is provided (radians, normalized to [-pi/4, pi/4]), skip angle calculation
+    and use it directly. This is used for merged tile-boundary polygons where the angle was
+    pre-computed from the clean (pre-merge) fragment.
+    """
+    from shapely.geometry import Polygon
+    from shapely.validation import make_valid
+    import math
+
+    # A. Calculate the True Architectural Angle using Robust Edge Scoring
+    # If forced_angle is provided, use it directly (pre-computed from clean fragment)
+    if forced_angle is not None:
+        angle = forced_angle
+    else:
+        angle = 0.0
+        try:
+            angle_simplify_tol = 0.8 if actual_simplify_tol > 0.1 else (0.8 / 111320)
+            pre_simplified = geom.simplify(angle_simplify_tol, preserve_topology=True)
+            coords = list(pre_simplified.exterior.coords)
+            
+            edges = []
+            for i in range(len(coords) - 1):
+                p1 = coords[i]
+                p2 = coords[i+1]
+                dx = p2[0] - p1[0]
+                dy = p2[1] - p1[1]
+                length = math.hypot(dx, dy)
+                if length < 1e-5: continue
+                
+                deg = math.degrees(math.atan2(dy, dx)) % 90.0
+                edges.append((deg, length))
+                
+            if not edges:
+                raise ValueError("No valid edges found")
+                
+            best_angle_deg = 0.0
+            max_score = -1.0
+            
+            # Test every edge's angle to see which one explains the most perimeter
+            for target_deg, _ in edges:
+                score = 0.0
+                for deg, length in edges:
+                    diff = abs(deg - target_deg)
+                    if diff > 45.0:
+                        diff = 90.0 - diff
+                    
+                    # If an edge is within 5 degrees of the target angle (or its orthogonal), it contributes to the score
+                    if diff <= 5.0:
+                        score += length * math.cos(math.radians(diff))
+                        
+                if score > max_score:
+                    max_score = score
+                    best_angle_deg = target_deg
+
+            angle = math.radians(best_angle_deg)
+                
+        except Exception as e:
+            print(f"DEBUG RTA: Exception in angle calc: {e}")
+            # Fallback to MBR if anything fails
+            mbr_coords = list(mbr.exterior.coords)
+            max_len = -1.0
+            for i in range(4):
+                dx = mbr_coords[i+1][0] - mbr_coords[i][0]
+                dy = mbr_coords[i+1][1] - mbr_coords[i][1]
+                length = math.hypot(dx, dy)
+                if length > max_len:
+                    max_len = length
+                    angle = math.atan2(dy, dx)
+                    
+        # Normalize angle to -45..45 degrees
+        angle = angle % (math.pi / 2)
+        if angle > math.pi / 4:
+            angle -= math.pi / 2
 
     centroid = geom.centroid
     cx, cy = centroid.x, centroid.y
@@ -666,7 +764,8 @@ def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr):
 
 
 def orthogonalize_polygon(geom, angle_tolerance_deg: float = 25.0, simplify_tol: float = 0.25,
-                          closing_radius: float = 0.35, strict_straight: bool = False):
+                          closing_radius: float = 0.35, strict_straight: bool = False,
+                          forced_angle: float = None):
     """
     Regularize a building polygon to have orthogonal (90°) corners while
     preserving the actual shape (L/U/compound) and healing tree-caused indents.
@@ -700,7 +799,7 @@ def orthogonalize_polygon(geom, angle_tolerance_deg: float = 25.0, simplify_tol:
         parts = []
         for p in geom.geoms:
             if isinstance(p, Polygon):
-                res = orthogonalize_polygon(p, angle_tolerance_deg, simplify_tol, closing_radius, strict_straight)
+                res = orthogonalize_polygon(p, angle_tolerance_deg, simplify_tol, closing_radius, strict_straight, forced_angle)
                 if res and not res.is_empty:
                     if isinstance(res, Polygon):
                         parts.append(res)
@@ -773,7 +872,7 @@ def orthogonalize_polygon(geom, angle_tolerance_deg: float = 25.0, simplify_tol:
             return mbr
 
         # ── Step C: Simplify + RTA Orthogonalization ────────────────────────────
-        result = _rta_orthogonalize(working_geom, angle_tolerance_deg, actual_simplify_tol, mbr)
+        result = _rta_orthogonalize(working_geom, angle_tolerance_deg, actual_simplify_tol, mbr, forced_angle=forced_angle)
         if result is not None:
             return result
 
@@ -837,7 +936,10 @@ def regularize_polygons(
             src = None
 
     new_geoms = []
-    for geom, raster_geom in zip(gdf.geometry, gdf_raster.geometry):
+    # Check if pre-computed angles are available (from merge_overlapping_fragments)
+    has_precomputed = "_precomputed_angle" in gdf.columns
+    
+    for idx, (geom, raster_geom) in enumerate(zip(gdf.geometry, gdf_raster.geometry)):
         strict_straight = False
         if src is not None:
             try:
@@ -866,17 +968,27 @@ def regularize_polygons(
             except Exception:
                 pass
         
+        # Use pre-computed angle if available (prevents tile-boundary seam corruption)
+        poly_forced_angle = None
+        if has_precomputed:
+            poly_forced_angle = gdf.iloc[idx]["_precomputed_angle"]
+        
         new_geoms.append(orthogonalize_polygon(
             geom, 
             angle_tolerance_deg=angle_tolerance, 
             simplify_tol=simplify_tolerance, 
-            strict_straight=strict_straight
+            strict_straight=strict_straight,
+            forced_angle=poly_forced_angle
         ))
 
     if src is not None:
         src.close()
 
     gdf["geometry"] = new_geoms
+
+    # Clean up internal column
+    if "_precomputed_angle" in gdf.columns:
+        gdf = gdf.drop(columns=["_precomputed_angle"])
 
     # Remove invalid geometries after regularization
     gdf = gdf[gdf.geometry.is_valid & ~gdf.geometry.is_empty].reset_index(drop=True)
@@ -991,15 +1103,30 @@ def merge_overlapping_fragments(
     """
     Merge polygons that overlap significantly or touch with a long shared boundary.
     This heals buildings that were cut by tile boundaries or YOLO bounding boxes.
+    
+    Pre-computes dominant angle for each fragment BEFORE merging, then inherits
+    the angle from the largest fragment. This prevents tile-boundary seam edges
+    from corrupting the regularization angle later.
     """
     import geopandas as gpd
     from shapely.ops import unary_union
 
     log = log_callback or (lambda x: None)
     if len(gdf) <= 1:
+        # Still compute angle for single polygon
+        if len(gdf) == 1:
+            angle = compute_dominant_angle(gdf.geometry.iloc[0])
+            gdf = gdf.copy()
+            gdf["_precomputed_angle"] = [angle]
         return gdf
 
     log("Menggabungkan fragmen bangunan yang tumpang tindih atau terpotong...")
+    
+    # ── PRE-COMPUTE dominant angle for each fragment BEFORE merge ──
+    # This is the key fix: angles are computed on clean, un-merged fragments
+    # that don't have artificial tile-boundary seam edges.
+    pre_angles = [compute_dominant_angle(geom) for geom in gdf.geometry]
+    pre_areas = [geom.area for geom in gdf.geometry]
     
     # Gunakan buffer kecil (sekitar 0.5 meter) untuk mendeteksi poligon yang terpotong 
     # lurus dan hanya bersentuhan (gap 0 piksel).
@@ -1011,11 +1138,14 @@ def merge_overlapping_fragments(
     buf_dist = 0.5 / 111320.0 if is_geographic else 0.5
 
     geoms = list(gdf.geometry)
+    # Track angle inheritance: each geom index maps to (angle, area) of its dominant fragment
+    angle_info = [(pre_angles[i], pre_areas[i]) for i in range(len(geoms))]
 
     changed = True
     while changed:
         changed = False
         new_geoms = []
+        new_angle_info = []
         skip_indices = set()
 
         for i in range(len(geoms)):
@@ -1024,6 +1154,9 @@ def merge_overlapping_fragments(
             g_i = geoms[i]
             if not g_i.is_valid:
                 g_i = g_i.buffer(0)
+            
+            # Track the best angle (from largest contributing fragment)
+            best_angle, best_area = angle_info[i]
             
             b1 = g_i.bounds
             # Perlebar bounding box check agar poligon yang bersebelahan lolos filter
@@ -1068,16 +1201,27 @@ def merge_overlapping_fragments(
                     g_i = unary_union([g_i, g_j]).buffer(0)
                     skip_indices.add(j)
                     changed = True
+                    # Inherit angle from the LARGEST original fragment
+                    j_angle, j_area = angle_info[j]
+                    if j_area > best_area:
+                        best_angle = j_angle
+                        best_area = j_area
                     # Update bounds untuk loop selanjutnya
                     b1 = g_i.bounds
                     b1_exp = (b1[0] - buf_dist, b1[1] - buf_dist, b1[2] + buf_dist, b1[3] + buf_dist)
 
             new_geoms.append(g_i)
+            new_angle_info.append((best_angle, best_area))
 
         geoms = new_geoms
+        angle_info = new_angle_info
 
     log(f"Fragmen digabung. Total poligon unik: {len(geoms)}")
-    return gpd.GeoDataFrame(geometry=geoms, crs=gdf.crs)
+    
+    result_gdf = gpd.GeoDataFrame(geometry=geoms, crs=gdf.crs)
+    # Store pre-computed angles as a column for use by regularize_polygons
+    result_gdf["_precomputed_angle"] = [info[0] for info in angle_info]
+    return result_gdf
 
 
 def resolve_overlaps(
@@ -1249,6 +1393,10 @@ def run_postprocess_pipeline(
             simplify_tolerance=simplify_tolerance,
             log_callback=log
         )
+    else:
+        # Clean up internal column even if regularization is skipped
+        if "_precomputed_angle" in gdf.columns:
+            gdf = gdf.drop(columns=["_precomputed_angle"])
 
     # 6. Resolve overlaps (avoid overlap)
     progress(93, "Menghilangkan poligon tumpang tindih (avoid overlap)...")
