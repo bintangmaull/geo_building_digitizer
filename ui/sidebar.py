@@ -32,7 +32,7 @@ class Sidebar(ctk.CTkScrollableFrame):
 
     TILE_OPTIONS = ["512", "1024", "2048"]
 
-    def __init__(self, parent, on_run: Callable, on_stop: Callable, on_train: Callable, on_train_yolo: Callable, on_wms_ready: Optional[Callable] = None, on_yolo_toggle: Optional[Callable] = None, on_build_fingerprint: Optional[Callable] = None, **kwargs):
+    def __init__(self, parent, on_run: Callable, on_stop: Callable, on_train: Callable, on_train_yolo: Callable, on_wms_ready: Optional[Callable] = None, on_yolo_toggle: Optional[Callable] = None, on_build_fingerprint: Optional[Callable] = None, on_train_road_unet: Optional[Callable] = None, **kwargs):
         super().__init__(parent, **kwargs)
         self.on_run = on_run
         self.on_stop = on_stop
@@ -41,6 +41,7 @@ class Sidebar(ctk.CTkScrollableFrame):
         self.on_wms_ready = on_wms_ready
         self.on_yolo_toggle = on_yolo_toggle
         self.on_build_fingerprint = on_build_fingerprint
+        self.on_train_road_unet = on_train_road_unet
         self._input_path = tk.StringVar()
         self._output_dir = tk.StringVar(value=str(os.path.join(os.getcwd(), "output")))
         self._input_mode = tk.StringVar(value="📁 File Lokal")  # or "🌐 WMS Online"
@@ -1201,6 +1202,171 @@ class Sidebar(ctk.CTkScrollableFrame):
         self.train_yolo_progress.set(0)
         row += 1
 
+        # ── 6d. Training U-Net Road ──────────────────────
+        row += 1; self._divider(row); row += 1
+        self._section_label("🛣️  TRAINING U-NET JALAN", row); row += 1
+
+        self.lbl_train_unet_geotiff = ctk.CTkLabel(
+            self,
+            text="1. File Citra Drone (GeoTIFF):",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#CBD5E1",
+            anchor="w",
+        )
+        self.lbl_train_unet_geotiff.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0))
+        row += 1
+
+        self.entry_train_unet_geotiff = ctk.CTkEntry(
+            self,
+            placeholder_text="Path citra .tif...",
+            font=ctk.CTkFont(size=11),
+            height=30,
+            fg_color="#0F172A",
+            border_color="#334155",
+            text_color="#E2E8F0",
+        )
+        self.entry_train_unet_geotiff.grid(row=row, column=0, sticky="ew", padx=(12, 4), pady=(0, 4))
+
+        self.btn_browse_train_unet_geotiff = ctk.CTkButton(
+            self,
+            text="📂",
+            width=36,
+            height=30,
+            corner_radius=6,
+            fg_color="#334155",
+            hover_color="#475569",
+            command=self._browse_train_unet_geotiff,
+        )
+        self.btn_browse_train_unet_geotiff.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=(0, 4))
+        row += 1
+
+        self.lbl_train_unet_shp = ctk.CTkLabel(
+            self,
+            text="2. Shapefile Jalan (Line/Polygon):",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#CBD5E1",
+            anchor="w",
+        )
+        self.lbl_train_unet_shp.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0))
+        row += 1
+
+        self.entry_train_unet_shp = ctk.CTkEntry(
+            self,
+            placeholder_text="Path jalan .shp (line/polygon)...",
+            font=ctk.CTkFont(size=11),
+            height=30,
+            fg_color="#0F172A",
+            border_color="#334155",
+            text_color="#E2E8F0",
+        )
+        self.entry_train_unet_shp.grid(row=row, column=0, sticky="ew", padx=(12, 4), pady=(0, 4))
+
+        self.btn_browse_train_unet_shp = ctk.CTkButton(
+            self,
+            text="📂",
+            width=36,
+            height=30,
+            corner_radius=6,
+            fg_color="#334155",
+            hover_color="#475569",
+            command=self._browse_train_unet_shp,
+        )
+        self.btn_browse_train_unet_shp.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=(0, 4))
+        row += 1
+
+        # Epochs slider
+        self.lbl_train_unet_epochs = ctk.CTkLabel(
+            self,
+            text="Epochs: 30",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#CBD5E1",
+            anchor="w",
+        )
+        self.lbl_train_unet_epochs.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0))
+        row += 1
+
+        self.train_unet_epochs_var = tk.IntVar(value=30)
+        self.slider_train_unet_epochs = ctk.CTkSlider(
+            self,
+            from_=10,
+            to=100,
+            number_of_steps=9,
+            variable=self.train_unet_epochs_var,
+            height=16,
+            fg_color="#1E293B",
+            progress_color="#10B981",
+            button_color="#10B981",
+            button_hover_color="#059669",
+            command=lambda v: self.lbl_train_unet_epochs.configure(text=f"Epochs: {int(v)}"),
+        )
+        self.slider_train_unet_epochs.grid(row=row, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 4))
+        row += 1
+
+        # Buffer width (for LineString SHP)
+        self.lbl_train_unet_buffer = ctk.CTkLabel(
+            self,
+            text="Lebar Jalan (buffer): 3.0m",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#CBD5E1",
+            anchor="w",
+        )
+        self.lbl_train_unet_buffer.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0))
+        row += 1
+
+        self.train_unet_buffer_var = tk.DoubleVar(value=3.0)
+        self.slider_train_unet_buffer = ctk.CTkSlider(
+            self,
+            from_=1.5,
+            to=8.0,
+            number_of_steps=13,
+            variable=self.train_unet_buffer_var,
+            height=16,
+            fg_color="#1E293B",
+            progress_color="#10B981",
+            button_color="#10B981",
+            button_hover_color="#059669",
+            command=lambda v: self.lbl_train_unet_buffer.configure(text=f"Lebar Jalan (buffer): {v:.1f}m"),
+        )
+        self.slider_train_unet_buffer.grid(row=row, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 4))
+        row += 1
+
+        self.btn_train_unet_run = ctk.CTkButton(
+            self,
+            text="🛣️  MULAI TRAINING U-NET JALAN",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            height=38,
+            corner_radius=8,
+            fg_color="#10B981",
+            hover_color="#059669",
+            text_color="#FFFFFF",
+            command=self._on_train_unet_road_clicked,
+        )
+        self.btn_train_unet_run.grid(row=row, column=0, columnspan=2, sticky="ew", padx=12, pady=(6, 4))
+        row += 1
+
+        self.lbl_train_unet_status = ctk.CTkLabel(
+            self,
+            text="Status: Idle (Siap training)",
+            font=ctk.CTkFont(size=10),
+            text_color="#64748B",
+            anchor="w",
+            wraplength=180,
+            justify="left",
+        )
+        self.lbl_train_unet_status.grid(row=row, column=0, columnspan=2, sticky="ew", padx=12, pady=(2, 0))
+        row += 1
+
+        self.train_unet_progress = ctk.CTkProgressBar(
+            self,
+            height=8,
+            corner_radius=4,
+            fg_color="#1E293B",
+            progress_color="#10B981",
+        )
+        self.train_unet_progress.grid(row=row, column=0, columnspan=2, sticky="ew", padx=12, pady=(4, 12))
+        self.train_unet_progress.set(0)
+        row += 1
+
         # ── 7. Footer ──────────────────────────────────
         ctk.CTkLabel(
             self,
@@ -1708,6 +1874,68 @@ class Sidebar(ctk.CTkScrollableFrame):
         self.btn_train_yolo_run.configure(state="normal", text="🎯  MULAI TRAINING YOLO")
         self.train_yolo_progress.set(1.0 if is_success else 0.0)
         self.lbl_train_yolo_status.configure(
+            text=f"Status: {final_msg}",
+            text_color="#10B981" if is_success else "#EF4444"
+        )
+
+    # ── U-Net Road Training Handlers ─────────────────────────────────────────
+
+    def _browse_train_unet_geotiff(self):
+        path = filedialog.askopenfilename(
+            title="Pilih Citra GeoTIFF",
+            filetypes=[("GeoTIFF", "*.tif *.tiff"), ("All", "*.*")],
+        )
+        if path:
+            self.entry_train_unet_geotiff.delete(0, "end")
+            self.entry_train_unet_geotiff.insert(0, path)
+
+    def _browse_train_unet_shp(self):
+        path = filedialog.askopenfilename(
+            title="Pilih Shapefile Jalan (Line atau Polygon)",
+            filetypes=[("Shapefile", "*.shp"), ("All", "*.*")],
+        )
+        if path:
+            self.entry_train_unet_shp.delete(0, "end")
+            self.entry_train_unet_shp.insert(0, path)
+
+    def _on_train_unet_road_clicked(self):
+        geotiff = self.entry_train_unet_geotiff.get().strip()
+        shp = self.entry_train_unet_shp.get().strip()
+
+        if not geotiff:
+            messagebox.showwarning("File Belum Lengkap", "Silakan pilih Citra GeoTIFF terlebih dahulu.")
+            return
+
+        if not shp:
+            messagebox.showwarning("File Belum Lengkap", "Silakan pilih Shapefile Jalan.")
+            return
+
+        if not os.path.exists(geotiff):
+            messagebox.showerror("File Tidak Ditemukan", f"Citra GeoTIFF tidak ditemukan:\n{geotiff}")
+            return
+
+        if not os.path.exists(shp):
+            messagebox.showerror("File Tidak Ditemukan", f"Shapefile Jalan tidak ditemukan:\n{shp}")
+            return
+
+        epochs = self.train_unet_epochs_var.get()
+        buffer_width = self.train_unet_buffer_var.get()
+
+        self.btn_train_unet_run.configure(state="disabled", text="⏳  Training U-Net...")
+        
+        if self.on_train_road_unet:
+            self.on_train_road_unet(geotiff, shp, epochs, buffer_width)
+
+    def set_training_unet_progress(self, percent: float, status_msg: str):
+        """Update progress bar and status text for U-Net road training."""
+        self.train_unet_progress.set(percent / 100.0)
+        self.lbl_train_unet_status.configure(text=f"Status: {status_msg}", text_color="#F59E0B")
+
+    def set_training_unet_idle(self, final_msg: str = "Idle (Siap training)", is_success: bool = True):
+        """Reset button states after U-Net road training."""
+        self.btn_train_unet_run.configure(state="normal", text="🛣️  MULAI TRAINING U-NET JALAN")
+        self.train_unet_progress.set(1.0 if is_success else 0.0)
+        self.lbl_train_unet_status.configure(
             text=f"Status: {final_msg}",
             text_color="#10B981" if is_success else "#EF4444"
         )

@@ -86,6 +86,7 @@ class SAMGeoApp(ctk.CTk):
             on_wms_ready=self._on_wms_ready,
             on_yolo_toggle=self._on_yolo_toggle,
             on_build_fingerprint=self._on_build_fingerprint,
+            on_train_road_unet=self._on_train_road_unet,
             width=240,
             fg_color="#0A1628",
             corner_radius=0,
@@ -531,6 +532,82 @@ class SAMGeoApp(ctk.CTk):
             self._log(f"❌ Error membuat fingerprint: {e}", "error")
             self._log(traceback.format_exc(), "error")
             self.after(0, lambda: self.sidebar.set_fingerprint_idle("Error fatal!", False))
+
+    # ── U-Net Road Training ──────────────────────────────────────────────────
+
+    def _on_train_road_unet(self, geotiff_path: str, shp_path: str, epochs: int, buffer_width: float):
+        """Starts the U-Net road segmentation training in a background thread."""
+        self.log_panel.reset()
+        self._log("=== MEMULAI TRAINING U-NET JALAN ===", "system")
+        self._log(f"Citra: {geotiff_path}")
+        self._log(f"SHP Jalan: {shp_path}")
+        self._log(f"Epochs: {epochs}, Buffer: {buffer_width}m")
+
+        thread = threading.Thread(
+            target=self._run_train_road_unet,
+            args=(geotiff_path, shp_path, epochs, buffer_width),
+            daemon=True,
+        )
+        thread.start()
+
+    def _train_unet_progress(self, percent: float, message: str = ""):
+        """Thread-safe U-Net training progress callback."""
+        self.after(0, lambda: self.sidebar.set_training_unet_progress(percent, message))
+        if message:
+            self._log(f"⚡ [U-Net] {message}", "info")
+
+    def _run_train_road_unet(self, geotiff_path: str, shp_path: str, epochs: int, buffer_width: float):
+        """Runs U-Net road dataset generation + training in background."""
+        from core.objects.road_dataset_generator import generate_road_training_data
+        from train_road_unet import train_road_unet
+
+        dataset_dir = os.path.join(ROOT, "dataset_road")
+        output_model = os.path.join(ROOT, "models", "road_unet.pth")
+
+        try:
+            # 1. Generate dataset
+            self._train_unet_progress(0, "Mempersiapkan dataset jalan...")
+            success = generate_road_training_data(
+                geotiff_path=geotiff_path,
+                shp_path=shp_path,
+                output_dir=dataset_dir,
+                chip_size=512,
+                target_gsd=0.15,
+                buffer_width_m=buffer_width,
+                log_callback=self._log,
+                progress_callback=self._train_unet_progress,
+            )
+
+            if not success:
+                self.after(0, lambda: self.sidebar.set_training_unet_idle("Ekstraksi dataset gagal!", False))
+                return
+
+            # 2. Train model
+            self._train_unet_progress(30, "Memulai training U-Net...")
+            success = train_road_unet(
+                dataset_dir=dataset_dir,
+                epochs=epochs,
+                batch_size=4,
+                lr=1e-4,
+                encoder_name="resnet34",
+                output_model_path=output_model,
+                log_callback=self._log,
+                progress_callback=self._train_unet_progress,
+            )
+
+            if success:
+                self._log("🎉 TRAINING U-NET JALAN SELESAI!", "success")
+                self._log(f"💾 Model disimpan di: {output_model}", "success")
+                self._log("💡 Gunakan file .pth ini sebagai model jalan untuk digitasi.", "success")
+                self.after(0, lambda: self.sidebar.set_training_unet_idle("Training sukses! Model siap.", True))
+            else:
+                self._log("❌ Training U-Net gagal.", "error")
+                self.after(0, lambda: self.sidebar.set_training_unet_idle("Training gagal!", False))
+
+        except Exception as e:
+            self._log(f"❌ Error selama training U-Net: {e}", "error")
+            self._log(traceback.format_exc(), "error")
+            self.after(0, lambda: self.sidebar.set_training_unet_idle("Error fatal!", False))
 
     def _run_pipeline(self, params: dict):
         """
