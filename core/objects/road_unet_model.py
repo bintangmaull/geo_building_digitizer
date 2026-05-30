@@ -210,6 +210,19 @@ def predict_tile(model, tile_rgb: np.ndarray, device="cuda", threshold=0.5) -> n
     # (1, 1, H, W) → (H, W)
     prob_np = prob.squeeze().cpu().numpy()
     
+    # Diagnostic: log probability stats
+    if prob_np.size > 0:
+        max_prob = prob_np.max()
+        mean_prob = prob_np.mean()
+        above_01 = (prob_np >= 0.1).sum()
+        above_03 = (prob_np >= 0.3).sum()
+        above_05 = (prob_np >= 0.5).sum()
+        import logging
+        logging.debug(
+            f"[U-Net tile] prob max={max_prob:.3f}, mean={mean_prob:.4f}, "
+            f">0.1: {above_01}, >0.3: {above_03}, >0.5: {above_05}"
+        )
+    
     binary = (prob_np >= threshold).astype(np.uint8) * 255
     return binary
 

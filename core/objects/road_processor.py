@@ -959,8 +959,8 @@ class RoadProcessor:
         raster_path: str,
         output_dir: str,
         tile_size: int = 1024,
-        min_area_m2: float = 50.0,
-        prob_threshold: float = 0.5,
+        min_area_m2: float = 10.0,
+        prob_threshold: float = 0.3,
         building_gdf=None,
     ) -> Tuple["geopandas.GeoDataFrame", "geopandas.GeoDataFrame"]:
         """
@@ -1036,11 +1036,11 @@ class RoadProcessor:
         self._log("Morphological cleanup (close gaps, remove noise)...")
 
         # Close small gaps (connect nearby road segments)
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_CLOSE, kernel_close)
 
         # Remove small noise blobs
-        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_OPEN, kernel_open)
 
         # Remove small connected components
