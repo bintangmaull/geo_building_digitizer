@@ -76,10 +76,33 @@ class RoadProcessor:
         if not os.path.isfile(self.fingerprint_path):
             raise FileNotFoundError(
                 f"File tidak ditemukan: {self.fingerprint_path}\n"
-                "Silakan buat fingerprint (.json) atau sediakan model YOLO (.pt)."
+                "Silakan buat fingerprint (.json) atau sediakan model YOLO (.pt) atau U-Net (.pth)."
             )
             
-        if self.fingerprint_path.endswith('.pt'):
+        if self.fingerprint_path.endswith('.pth'):
+            self.mode = 'unet'
+            try:
+                import torch
+                from core.objects.road_unet_model import create_road_unet
+                
+                checkpoint = torch.load(self.fingerprint_path, map_location='cpu')
+                encoder_name = checkpoint.get('encoder_name', 'resnet34')
+                
+                self._unet = create_road_unet(encoder_name=encoder_name, encoder_weights=None)
+                self._unet.load_state_dict(checkpoint['model_state_dict'])
+                
+                self._device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                self._unet = self._unet.to(self._device)
+                self._unet.eval()
+                
+                val_iou = checkpoint.get('val_iou', '?')
+                self._log(f"Model U-Net dimuat: {Path(self.fingerprint_path).name}")
+                self._log(f"  Encoder: {encoder_name}, Val IoU: {val_iou}")
+                self._log(f"  Device: {self._device}")
+            except Exception as e:
+                self._log(f"Gagal memuat U-Net: {e}")
+                raise
+        elif self.fingerprint_path.endswith('.pt'):
             self.mode = 'yolo'
             try:
                 from ultralytics import YOLO
@@ -723,7 +746,10 @@ class RoadProcessor:
         from core.objects.road_fingerprint import RoadFingerprintBuilder
         from core.tiling import tiles_generator
 
-        if getattr(self, 'mode', 'mahalanobis') == 'mahalanobis':
+        if getattr(self, 'mode', 'mahalanobis') == 'unet':
+            # ── U-Net Pipeline (center-crop stitching + direct vectorization) ──
+            return self._process_raster_unet(raster_path, output_dir, tile_size, min_area_m2, prob_threshold, building_gdf)
+        elif getattr(self, 'mode', 'mahalanobis') == 'mahalanobis':
             if self._fingerprint is None:
                 self.load_fingerprint()
             norm_params = self._fingerprint.get("normalization", {})
@@ -923,3 +949,161 @@ class RoadProcessor:
         self._progress(100, f"Jalan selesai: {len(gdf_polygon)} polygon")
         gc.collect()
         return gdf_polygon, gdf_centerline
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # U-NET PIPELINE (Center-Crop Stitching + Direct Vectorization)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _process_raster_unet(
+        self,
+        raster_path: str,
+        output_dir: str,
+        tile_size: int = 1024,
+        min_area_m2: float = 50.0,
+        prob_threshold: float = 0.5,
+        building_gdf=None,
+    ) -> Tuple["geopandas.GeoDataFrame", "geopandas.GeoDataFrame"]:
+        """
+        U-Net road extraction pipeline with center-crop stitching.
+        
+        Strategy:
+            1. Predict full-resolution mask using center-crop stitching (no tile boundary artifacts)
+            2. Exclude building areas from mask
+            3. Morphological cleanup
+            4. Direct vectorization (contour → polygon, no skeleton)
+            5. Extract centerlines from clean polygons (Voronoi medial axis)
+        
+        Returns:
+            (gdf_polygon, gdf_centerline)
+        """
+        import rasterio
+        import geopandas as gpd
+        import cv2
+        from rasterio.features import geometry_mask
+        from core.objects.road_unet_model import predict_raster_center_crop
+        from core.objects.road_vectorizer import mask_to_road_polygons, polygons_to_centerlines
+
+        self._log(f"=== U-NET ROAD PIPELINE ===")
+        self._log(f"Raster: {Path(raster_path).name}")
+        self._log(f"Tile size: {tile_size}, Crop: {tile_size // 2}")
+        self._progress(5, "Memulai prediksi U-Net...")
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        # ── Step 1: Full-resolution prediction with center-crop stitching ────
+        crop_size = tile_size // 2  # 50% overlap → center crop
+
+        full_mask = predict_raster_center_crop(
+            model=self._unet,
+            raster_path=raster_path,
+            tile_size=tile_size,
+            crop_size=crop_size,
+            device=self._device,
+            threshold=prob_threshold,
+            log_callback=self._log,
+            progress_callback=lambda pct, msg: self._progress(5 + int(pct * 0.6), msg),
+        )
+
+        road_pixels = (full_mask > 0).sum()
+        self._log(f"Prediksi selesai. Road pixels: {road_pixels:,}")
+
+        if road_pixels == 0:
+            self._log("⚠ Tidak ada jalan terdeteksi.")
+            with rasterio.open(raster_path) as src:
+                empty = gpd.GeoDataFrame(geometry=[], crs=src.crs)
+            return empty, empty
+
+        # ── Step 2: Exclude building areas ───────────────────────────────────
+        if building_gdf is not None and len(building_gdf) > 0:
+            self._log("Mengecualikan area bangunan dari mask jalan...")
+            with rasterio.open(raster_path) as src:
+                try:
+                    shapes = [g for g in building_gdf.geometry if g is not None]
+                    bldg_mask = geometry_mask(
+                        shapes,
+                        transform=src.transform,
+                        invert=True,
+                        out_shape=(src.height, src.width),
+                    )
+                    full_mask[bldg_mask] = 0
+                    removed = road_pixels - (full_mask > 0).sum()
+                    self._log(f"  Dihapus {removed:,} piksel di area bangunan")
+                except Exception as e:
+                    self._log(f"  ⚠ Building exclusion gagal: {e}")
+
+        # ── Step 3: Morphological cleanup ────────────────────────────────────
+        self._progress(70, "Morphological cleanup...")
+        self._log("Morphological cleanup (close gaps, remove noise)...")
+
+        # Close small gaps (connect nearby road segments)
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_CLOSE, kernel_close)
+
+        # Remove small noise blobs
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_OPEN, kernel_open)
+
+        # Remove small connected components
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(full_mask, connectivity=8)
+        
+        with rasterio.open(raster_path) as src:
+            pixel_size_m = abs(src.transform.a)
+            tile_crs = src.crs
+            raster_transform = src.transform
+            if tile_crs and tile_crs.is_geographic:
+                pixel_size_m *= 111320.0
+
+        min_area_px = int(min_area_m2 / (pixel_size_m ** 2))
+        
+        cleaned_mask = np.zeros_like(full_mask)
+        kept_blobs = 0
+        for lbl in range(1, n_labels):
+            if stats[lbl, cv2.CC_STAT_AREA] >= min_area_px:
+                cleaned_mask[labels == lbl] = 255
+                kept_blobs += 1
+
+        self._log(f"  Blobs setelah cleanup: {kept_blobs} (min area: {min_area_m2}m²)")
+
+        if cleaned_mask.max() == 0:
+            self._log("⚠ Tidak ada jalan tersisa setelah cleanup.")
+            empty = gpd.GeoDataFrame(geometry=[], crs=tile_crs)
+            return empty, empty
+
+        # ── Step 4: Direct vectorization (no skeleton!) ──────────────────────
+        self._progress(80, "Vektorisasi langsung (direct contour)...")
+        self._log("Vektorisasi mask → polygon (direct, tanpa skeleton)...")
+
+        gdf_polygon = mask_to_road_polygons(
+            binary_mask=cleaned_mask,
+            transform=raster_transform,
+            crs=tile_crs,
+            min_area_m2=min_area_m2,
+            simplify_tol_m=0.8,
+            smooth_iterations=2,
+            log_callback=self._log,
+        )
+
+        self._log(f"  Road polygons: {len(gdf_polygon)}")
+
+        # ── Step 5: Extract centerlines from polygons ────────────────────────
+        self._progress(90, "Mengekstrak centerline dari polygon...")
+        self._log("Mengekstrak centerline (Voronoi medial axis)...")
+
+        gdf_centerline = polygons_to_centerlines(
+            gdf_polygons=gdf_polygon,
+            simplify_tol_m=1.5,
+            min_length_m=10.0,
+            log_callback=self._log,
+        )
+
+        self._log(f"  Centerlines: {len(gdf_centerline)}")
+
+        # ── Done ─────────────────────────────────────────────────────────────
+        self._log(
+            f"=== U-NET SELESAI: {len(gdf_polygon)} polygon jalan, "
+            f"{len(gdf_centerline)} segmen centerline ==="
+        )
+        self._progress(100, f"Jalan selesai: {len(gdf_polygon)} polygon")
+        gc.collect()
+        return gdf_polygon, gdf_centerline
+
