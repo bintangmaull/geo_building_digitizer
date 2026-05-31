@@ -27,3 +27,6 @@ dataset_yolo/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Images
+*.png
