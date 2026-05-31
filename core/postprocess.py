@@ -116,27 +116,40 @@ def merge_tile_masks(
     # Group polygons by building_id (Global YOLO Box ID)
     # This perfectly merges halves of buildings cut by tile boundaries, WITHOUT merging distinct adjacent buildings!
     final_geoms = []
-    
-    if "building_id" in gdf.columns:
+    final_ids = []
+    has_building_id = "building_id" in gdf.columns
+
+    if has_building_id:
+        from shapely.geometry import MultiPolygon, Polygon, GeometryCollection
         for b_id, group in gdf.groupby("building_id"):
             union_geom = group.geometry.unary_union
-            
-            # Explode if necessary
-            from shapely.geometry import MultiPolygon, Polygon, GeometryCollection
+
+            # Explode if necessary — each exploded part inherits its group's building_id
             if isinstance(union_geom, Polygon):
                 final_geoms.append(union_geom)
+                final_ids.append(b_id)
             elif isinstance(union_geom, MultiPolygon):
-                final_geoms.extend(list(union_geom.geoms))
+                for geom in union_geom.geoms:
+                    final_geoms.append(geom)
+                    final_ids.append(b_id)
             elif isinstance(union_geom, GeometryCollection):
                 for geom in union_geom.geoms:
                     if isinstance(geom, Polygon):
                         final_geoms.append(geom)
+                        final_ids.append(b_id)
                     elif isinstance(geom, MultiPolygon):
-                        final_geoms.extend(list(geom.geoms))
+                        for g in geom.geoms:
+                            final_geoms.append(g)
+                            final_ids.append(b_id)
     else:
         final_geoms = list(gdf.geometry)
 
-    final_gdf = gpd.GeoDataFrame(geometry=final_geoms, crs=gdf.crs)
+    if has_building_id:
+        final_gdf = gpd.GeoDataFrame(
+            {"geometry": final_geoms, "building_id": final_ids}, crs=gdf.crs
+        )
+    else:
+        final_gdf = gpd.GeoDataFrame(geometry=final_geoms, crs=gdf.crs)
     final_gdf = final_gdf.reset_index(drop=True)
     log(f"Poligon setelah deduplication: {len(final_gdf)}")
     return final_gdf
@@ -610,8 +623,10 @@ def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr, forc
     # This mathematical trick swallows diagonal tree bites and restores perfect 90-degree corners,
     # while preserving large H/V architectural features (L-shapes).
     if is_strict and not simplified.is_empty:
-        # Mitre radius: 3.5 meters (or equivalent in degrees)
-        r_mitre = 3.5 if actual_simplify_tol > 0.1 else (3.5 / 111320)
+        # Mitre radius: 1.5 meters (or equivalent in degrees)
+        # Lowered from 3.5m: fills tree bites (1-3m) without destroying real
+        # architecture notches (>3m) in dense housing, preventing overshoot.
+        r_mitre = 1.5 if actual_simplify_tol > 0.1 else (1.5 / 111320)
         try:
             # join_style=2 is MITRE, cap_style=3 is SQUARE
             simplified = simplified.buffer(r_mitre, join_style=2).buffer(-r_mitre, join_style=2)
@@ -743,8 +758,9 @@ def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr, forc
     if not orthogonalized_geom.is_empty and orthogonalized_geom.is_valid:
         bounds = orthogonalized_geom.bounds
         mbr_area = (bounds[2] - bounds[0]) * (bounds[3] - bounds[1])
-        # A chamfered rectangle has area ~95% of its MBR.
-        if mbr_area > 0 and (orthogonalized_geom.area / mbr_area) > 0.92:
+        # Only heal near-perfect rectangles: ratio > 0.96 means the deviation is a
+        # true chamfered corner (≤4%), not a genuine notch. Higher = tighter fit.
+        if mbr_area > 0 and (orthogonalized_geom.area / mbr_area) > 0.96:
             new_coords = [
                 (bounds[0], bounds[1]),
                 (bounds[2], bounds[1]),
@@ -764,7 +780,7 @@ def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr, forc
 
 
 def orthogonalize_polygon(geom, angle_tolerance_deg: float = 25.0, simplify_tol: float = 0.25,
-                          closing_radius: float = 0.35, strict_straight: bool = False,
+                          closing_radius: float = 0.20, strict_straight: bool = False,
                           forced_angle: float = None):
     """
     Regularize a building polygon to have orthogonal (90°) corners while
@@ -846,8 +862,10 @@ def orthogonalize_polygon(geom, angle_tolerance_deg: float = 25.0, simplify_tol:
                       .buffer(-actual_closing_radius))
             closed = make_valid(closed)
             if closed and not closed.is_empty and closed.area > 0:
-                # Allow up to 60% area growth (tree cover ≤ ~37% of building area)
-                if closed.area / geom.area <= 1.6:
+                # Cap closing growth at 15%: legit jitter-closing is <5%; a larger
+                # jump means the buffer swallowed a courtyard or bulged toward a
+                # neighbor (row-house), which causes overshoot.
+                if closed.area / geom.area <= 1.15:
                     working_geom = closed
         except Exception:
             pass  # Keep raw geom if buffer fails
@@ -866,9 +884,10 @@ def orthogonalize_polygon(geom, angle_tolerance_deg: float = 25.0, simplify_tol:
         solidity = (working_geom.area / working_geom.convex_hull.area
                     if working_geom.convex_hull.area > 0 else 0)
 
-        # Strict threshold: only rectangularize near-perfect boxes,
-        # let L/U/compound shapes proceed to RTA orthogonalization.
-        if iou >= 0.90 and solidity >= 0.95:
+        # Strict threshold: only rectangularize near-perfect boxes (≤3% deviation
+        # from MBR). MBR always circumscribes, so a looser threshold adds outward
+        # bulge past the roof edge. L/U/compound shapes proceed to RTA orthogonalization.
+        if iou >= 0.97 and solidity >= 0.97:
             return mbr
 
         # ── Step C: Simplify + RTA Orthogonalization ────────────────────────────
@@ -1098,26 +1117,40 @@ def filter_non_building_colors(
 def merge_overlapping_fragments(
     gdf: "geopandas.GeoDataFrame",
     threshold: float = 0.12,  # Diturunkan sedikit dari 0.15 agar lebih sensitif
+    respect_building_id: bool = False,
     log_callback=None,
 ) -> "geopandas.GeoDataFrame":
     """
     Merge polygons that overlap significantly or touch with a long shared boundary.
     This heals buildings that were cut by tile boundaries or YOLO bounding boxes.
-    
+
     Pre-computes dominant angle for each fragment BEFORE merging, then inherits
     the angle from the largest fragment. This prevents tile-boundary seam edges
     from corrupting the regularization angle later.
+
+    If respect_building_id=True AND a 'building_id' column is present (YOLO mode),
+    two polygons with DIFFERENT building_id are never merged. In YOLO mode the
+    tile-cut healing is already done by building_id grouping in merge_tile_masks,
+    so this guard prevents distinct adjacent row-houses (sharing a wall) from being
+    wrongly fused while still allowing same-building fragments to merge.
     """
     import geopandas as gpd
+    import pandas as pd
     from shapely.ops import unary_union
 
     log = log_callback or (lambda x: None)
+
+    has_bid = respect_building_id and ("building_id" in gdf.columns)
+    ids = list(gdf["building_id"]) if has_bid else [None] * len(gdf)
+
     if len(gdf) <= 1:
         # Still compute angle for single polygon
         if len(gdf) == 1:
             angle = compute_dominant_angle(gdf.geometry.iloc[0])
             gdf = gdf.copy()
             gdf["_precomputed_angle"] = [angle]
+            if has_bid:
+                gdf["building_id"] = [ids[0]]
         return gdf
 
     log("Menggabungkan fragmen bangunan yang tumpang tindih atau terpotong...")
@@ -1138,8 +1171,10 @@ def merge_overlapping_fragments(
     buf_dist = 0.5 / 111320.0 if is_geographic else 0.5
 
     geoms = list(gdf.geometry)
-    # Track angle inheritance: each geom index maps to (angle, area) of its dominant fragment
-    angle_info = [(pre_angles[i], pre_areas[i]) for i in range(len(geoms))]
+    # Track inheritance: each geom index maps to (angle, area, building_id) of its
+    # dominant fragment. Folding building_id into angle_info lets it travel with the
+    # rebuilt geoms list each pass (ids[] indices would desync after the first pass).
+    angle_info = [(pre_angles[i], pre_areas[i], ids[i]) for i in range(len(geoms))]
 
     changed = True
     while changed:
@@ -1156,7 +1191,7 @@ def merge_overlapping_fragments(
                 g_i = g_i.buffer(0)
             
             # Track the best angle (from largest contributing fragment)
-            best_angle, best_area = angle_info[i]
+            best_angle, best_area, cur_id = angle_info[i]
             
             b1 = g_i.bounds
             # Perlebar bounding box check agar poligon yang bersebelahan lolos filter
@@ -1171,6 +1206,15 @@ def merge_overlapping_fragments(
                 # Fast bounding box check
                 if b1_exp[2] < b2[0] or b1_exp[0] > b2[2] or b1_exp[3] < b2[1] or b1_exp[1] > b2[3]:
                     continue
+
+                # Building-ID guard (YOLO mode): never merge two DIFFERENT buildings.
+                # Same-building fragments share an id and still merge; row-houses with
+                # distinct ids are kept separate. NaN/None on either side → geometry fallback.
+                if has_bid:
+                    id_j = angle_info[j][2]
+                    if (cur_id is not None and not pd.isna(cur_id)) and \
+                       (id_j is not None and not pd.isna(id_j)) and cur_id != id_j:
+                        continue
 
                 if not g_j.is_valid:
                     g_j = g_j.buffer(0)
@@ -1201,26 +1245,29 @@ def merge_overlapping_fragments(
                     g_i = unary_union([g_i, g_j]).buffer(0)
                     skip_indices.add(j)
                     changed = True
-                    # Inherit angle from the LARGEST original fragment
-                    j_angle, j_area = angle_info[j]
+                    # Inherit angle AND building_id from the LARGEST original fragment
+                    j_angle, j_area, j_id = angle_info[j]
                     if j_area > best_area:
                         best_angle = j_angle
                         best_area = j_area
+                        cur_id = j_id
                     # Update bounds untuk loop selanjutnya
                     b1 = g_i.bounds
                     b1_exp = (b1[0] - buf_dist, b1[1] - buf_dist, b1[2] + buf_dist, b1[3] + buf_dist)
 
             new_geoms.append(g_i)
-            new_angle_info.append((best_angle, best_area))
+            new_angle_info.append((best_angle, best_area, cur_id))
 
         geoms = new_geoms
         angle_info = new_angle_info
 
     log(f"Fragmen digabung. Total poligon unik: {len(geoms)}")
-    
+
     result_gdf = gpd.GeoDataFrame(geometry=geoms, crs=gdf.crs)
     # Store pre-computed angles as a column for use by regularize_polygons
     result_gdf["_precomputed_angle"] = [info[0] for info in angle_info]
+    if has_bid:
+        result_gdf["building_id"] = [info[2] for info in angle_info]
     return result_gdf
 
 
@@ -1327,6 +1374,7 @@ def run_postprocess_pipeline(
     enable_regularization: bool = True,
     angle_tolerance: float = 15.0,
     simplify_tolerance: float = 0.75,
+    respect_building_id: bool = False,
     log_callback: Optional[Callable[[str], None]] = None,
     progress_callback: Optional[Callable[[int, str], None]] = None,
 ) -> "geopandas.GeoDataFrame":
@@ -1379,7 +1427,7 @@ def run_postprocess_pipeline(
     # 4c. Merge overlapping fragments (duplicate detections of the same building)
     # MUST be done before regularization so the regularizer sees the full complex roof!
     progress(90, "Menggabungkan fragmen bangunan yang tumpang tindih...")
-    gdf = merge_overlapping_fragments(gdf, threshold=0.12, log_callback=log)
+    gdf = merge_overlapping_fragments(gdf, threshold=0.12, respect_building_id=respect_building_id, log_callback=log)
 
     # 5. Regularization
     if enable_regularization:

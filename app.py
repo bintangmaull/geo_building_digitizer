@@ -767,6 +767,7 @@ class SAMGeoApp(ctk.CTk):
                 enable_vegetation_filter=params.get("enable_vegetation_filter", True),
                 enable_regularization=params["enable_regularization"],
                 simplify_tolerance=params.get("simplify_tolerance", 0.75),
+                respect_building_id=("YOLO" in params.get("mode", "")),
                 log_callback=self._log,
                 progress_callback=self._progress,
             )

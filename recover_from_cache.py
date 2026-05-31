@@ -47,7 +47,8 @@ def recover():
             enable_shadow_filter=True,       # Sesuaikan dengan pengaturan Anda
             enable_vegetation_filter=True,   # Sesuaikan dengan pengaturan Anda
             enable_regularization=True,
-            simplify_tolerance=15.0,         # Sesuai dengan log Anda: toleransi=15.0
+            simplify_tolerance=0.75,         # Cocok dengan GUI (bukan 15.0 yang merusak detail)
+            respect_building_id=True,        # Mode YOLO: cegah rumah deret salah-gabung
             log_callback=lambda msg: print(f"  [Log] {msg}")
         )
         
