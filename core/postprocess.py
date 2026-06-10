@@ -121,8 +121,52 @@ def merge_tile_masks(
 
     if has_building_id:
         from shapely.geometry import MultiPolygon, Polygon, GeometryCollection
+        from shapely.ops import unary_union
+
+        def _smart_combine(group):
+            """
+            Combine fragments of the SAME building_id intelligently.
+
+            A building inside the tile overlap zone is segmented by SAM in MULTIPLE
+            overlapping tiles. These fragments are slightly misaligned, so blindly
+            union-ing them produces a thick, jagged outline whose orientation is
+            skewed (the cause of rotated buildings — worse with larger overlap).
+
+            Strategy:
+              - If one fragment dominates (its area ≥ 85% of the union area), the
+                fragments are duplicate segmentations of the same area → keep the
+                single LARGEST (cleanest) fragment, discard the jagged duplicates.
+              - Otherwise the fragments are complementary halves of a building cut
+                cleanly across tiles → union them as before.
+            """
+            geoms_list = [g for g in group.geometry if g is not None and not g.is_empty]
+            if not geoms_list:
+                return None
+            if len(geoms_list) == 1:
+                return geoms_list[0]
+
+            try:
+                u = unary_union(geoms_list)
+                union_area = u.area
+            except Exception:
+                u = None
+                union_area = 0.0
+
+            areas = [g.area for g in geoms_list]
+            max_area = max(areas)
+            largest = geoms_list[areas.index(max_area)]
+
+            # Duplicate segmentations (heavy mutual overlap) → use cleanest single fragment
+            if union_area > 0 and (max_area / union_area) >= 0.85:
+                return largest
+
+            # Complementary halves → union is correct
+            return u if u is not None else largest
+
         for b_id, group in gdf.groupby("building_id"):
-            union_geom = group.geometry.unary_union
+            union_geom = _smart_combine(group)
+            if union_geom is None or union_geom.is_empty:
+                continue
 
             # Explode if necessary — each exploded part inherits its group's building_id
             if isinstance(union_geom, Polygon):
@@ -1420,6 +1464,183 @@ def resolve_overlaps(
 
 
 # ──────────────────────────────────────────────
+# STEP 4d: Neighborhood Angle Voting
+# ──────────────────────────────────────────────
+
+def vote_neighborhood_angles(
+    gdf: "geopandas.GeoDataFrame",
+    search_radius_m: float = 30.0,
+    min_neighbors: int = 3,
+    snap_threshold_deg: float = 20.0,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> "geopandas.GeoDataFrame":
+    """
+    Align each building's orientation to the dominant orientation of its neighbors.
+
+    Rationale: in dense settlements, neighboring buildings are almost always
+    near-parallel. A building whose computed angle is an outlier vs its neighbors
+    is usually a tile-seam artifact. We snap such outliers to the local consensus
+    orientation while leaving genuinely differently-oriented buildings alone.
+
+    Algorithm:
+      1. Each building's base angle = existing _precomputed_angle (or computed via MRR).
+         Angles are orientations in [-45°, 45°] (modulo 90°).
+      2. For each building, gather neighbors whose centroid is within search_radius_m.
+      3. Compute the circular-mean orientation of neighbors (period 90°), area-weighted.
+      4. If the building's angle differs from the neighborhood mean by LESS than
+         snap_threshold_deg, snap it to the neighborhood mean (it belongs to the grid).
+         If it differs by MORE, leave it (genuinely different orientation).
+      5. Write the (possibly updated) angle back to _precomputed_angle.
+
+    This only changes the regularization ANGLE, never the geometry itself.
+    """
+    import math
+    import geopandas as gpd
+    import numpy as np
+
+    log = log_callback or (lambda x: None)
+
+    n = len(gdf)
+    if n < min_neighbors + 1:
+        return gdf
+
+    gdf = gdf.copy()
+
+    # ── Base angles (radians, [-pi/4, pi/4]) ──
+    if "_precomputed_angle" in gdf.columns:
+        base_angles = []
+        for i in range(n):
+            v = gdf["_precomputed_angle"].iloc[i]
+            if v is None or (isinstance(v, float) and math.isnan(v)):
+                base_angles.append(compute_dominant_angle(gdf.geometry.iloc[i]))
+            else:
+                base_angles.append(float(v))
+    else:
+        base_angles = [compute_dominant_angle(g) for g in gdf.geometry]
+
+    # ── Shape reliability score: IoU between polygon and its MBR ──
+    # A clean rectangular building has IoU ≈ 1 → its own angle is trustworthy.
+    # A jagged seam-artifact (from misaligned tile fragments) has low IoU → its
+    # computed angle is unreliable and should defer to the neighborhood consensus
+    # even when the angular difference is large.
+    reliability = []
+    for g in gdf.geometry:
+        try:
+            mbr = g.minimum_rotated_rectangle
+            inter = g.intersection(mbr).area
+            uni = g.union(mbr).area
+            reliability.append(inter / uni if uni > 0 else 0.0)
+        except Exception:
+            reliability.append(1.0)
+
+    # ── Metric coordinates for distance & area ──
+    is_geographic = gdf.crs and gdf.crs.is_geographic
+    if is_geographic:
+        try:
+            gdf_metric = gdf.to_crs(gdf.estimate_utm_crs())
+        except Exception:
+            gdf_metric = gdf
+    else:
+        gdf_metric = gdf
+
+    centroids = [g.centroid for g in gdf_metric.geometry]
+    cxs = np.array([c.x for c in centroids])
+    cys = np.array([c.y for c in centroids])
+    areas = np.array([max(g.area, 1e-9) for g in gdf_metric.geometry])
+
+    # Convert orientation angle (period 90°) → full-circle angle by ×4 for circular mean
+    # theta in [-pi/4, pi/4] → 4*theta in [-pi, pi]
+    base = np.array(base_angles)
+    quad = 4.0 * base
+    sin_q = np.sin(quad)
+    cos_q = np.cos(quad)
+
+    new_angles = list(base_angles)
+    snapped_count = 0
+    r2 = search_radius_m * search_radius_m
+    rel_arr = np.array(reliability)
+    # Voting weight = area × reliability. Jagged/unreliable buildings barely vote,
+    # so they cannot pollute the neighborhood consensus orientation.
+    vote_weight = areas * np.clip(rel_arr, 0.0, 1.0)
+
+    for i in range(n):
+        # Find neighbors within search radius (excluding self)
+        dx = cxs - cxs[i]
+        dy = cys - cys[i]
+        dist2 = dx * dx + dy * dy
+        mask = (dist2 <= r2)
+        mask[i] = False
+
+        neighbor_idx = np.where(mask)[0]
+        if len(neighbor_idx) < min_neighbors:
+            continue
+
+        # Area×reliability-weighted circular mean of neighbor orientations (period 90°)
+        w = vote_weight[neighbor_idx]
+        if w.sum() <= 0:
+            w = areas[neighbor_idx]
+        mean_sin = np.average(sin_q[neighbor_idx], weights=w)
+        mean_cos = np.average(cos_q[neighbor_idx], weights=w)
+        if abs(mean_sin) < 1e-12 and abs(mean_cos) < 1e-12:
+            continue
+        neighborhood_angle = math.atan2(mean_sin, mean_cos) / 4.0  # back to [-pi/4, pi/4]
+
+        # ── Robust refinement: drop neighbors that are outliers vs the first-pass
+        # mean, then recompute. This prevents a single misaligned neighbor from
+        # dragging the consensus away from the true local grid orientation.
+        inlier_mask = []
+        for ni in neighbor_idx:
+            d = base_angles[ni] - neighborhood_angle
+            while d > math.pi / 4:
+                d -= math.pi / 2
+            while d < -math.pi / 4:
+                d += math.pi / 2
+            inlier_mask.append(abs(math.degrees(d)) <= snap_threshold_deg)
+        inlier_mask = np.array(inlier_mask)
+        if inlier_mask.sum() >= min_neighbors:
+            inliers = neighbor_idx[inlier_mask]
+            w2 = vote_weight[inliers]
+            if w2.sum() <= 0:
+                w2 = areas[inliers]
+            ms = np.average(sin_q[inliers], weights=w2)
+            mc = np.average(cos_q[inliers], weights=w2)
+            if not (abs(ms) < 1e-12 and abs(mc) < 1e-12):
+                neighborhood_angle = math.atan2(ms, mc) / 4.0
+
+        # Angular difference (period 90° → compare in [-45,45])
+        diff = base_angles[i] - neighborhood_angle
+        # Wrap into [-pi/4, pi/4]
+        while diff > math.pi / 4:
+            diff -= math.pi / 2
+        while diff < -math.pi / 4:
+            diff += math.pi / 2
+        diff_deg = abs(math.degrees(diff))
+
+        # Adaptive snap threshold based on shape reliability:
+        # - Clean buildings (high MBR-IoU): use the normal threshold; only snap if the
+        #   building already roughly agrees with the grid (preserve genuine outliers).
+        # - Jagged buildings (low MBR-IoU, likely tile-seam artifacts): their own angle
+        #   is untrustworthy, so snap to the neighborhood consensus even for large diffs.
+        rel = reliability[i]
+        if rel < 0.80:
+            # Unreliable shape → always defer to neighborhood
+            effective_threshold = 45.0
+        else:
+            effective_threshold = snap_threshold_deg
+
+        if diff_deg < effective_threshold:
+            # Belongs to the local grid → snap to neighborhood consensus
+            new_angles[i] = neighborhood_angle
+            if diff_deg > 1.0:
+                snapped_count += 1
+        # else: genuinely different orientation → keep its own angle
+
+    gdf["_precomputed_angle"] = new_angles
+    log(f"Voting orientasi tetangga: {snapped_count} bangunan diselaraskan ke grid lingkungan")
+    return gdf
+
+
+# ──────────────────────────────────────────────
 # MAIN POST-PROCESS PIPELINE
 # ──────────────────────────────────────────────
 
@@ -1500,6 +1721,12 @@ def run_postprocess_pipeline(
     # MUST be done before regularization so the regularizer sees the full complex roof!
     progress(90, "Menggabungkan fragmen bangunan yang tumpang tindih...")
     gdf = merge_overlapping_fragments(gdf, threshold=0.12, respect_building_id=respect_building_id, log_callback=log)
+
+    # 4d. Neighborhood angle voting — snap each building's orientation to the dominant
+    # orientation of its neighbors. In dense settlements buildings are near-parallel,
+    # so this removes lone "rotated" buildings (often caused by tile-seam artifacts).
+    progress(90, "Voting orientasi tetangga (menyelaraskan sudut bangunan)...")
+    gdf = vote_neighborhood_angles(gdf, log_callback=log)
 
     # 5. Regularization
     effective_reg_mode = regularization_mode if enable_regularization else "off"

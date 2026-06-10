@@ -14,7 +14,9 @@ from typing import Callable, Generator, List, Optional, Tuple
 
 # Default tile configuration
 DEFAULT_TILE_SIZE = 1024   # pixels
-DEFAULT_OVERLAP = 128      # pixels (12.5% overlap for 1024 tile)
+DEFAULT_OVERLAP = 256      # pixels (25% overlap for 1024 tile) — larger overlap keeps
+                           # more buildings whole within a single tile, reducing
+                           # tile-boundary seam artifacts that cause rotation errors
 
 
 def calculate_tile_grid(
