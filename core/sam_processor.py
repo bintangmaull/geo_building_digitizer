@@ -78,6 +78,7 @@ class SAMProcessor:
         mode: str = "Otomatis (Grid Buta)",
         yolo_model_name: str = "yolov8n.pt",
         yolo_conf: float = 0.15,
+        gemini_api_key: str = "",
         log_callback: Optional[Callable[[str], None]] = None,
         progress_callback: Optional[Callable[[int, str], None]] = None,
     ):
@@ -86,8 +87,13 @@ class SAMProcessor:
         self.points_per_side = points_per_side
         self.yolo_model_name = yolo_model_name
         self.yolo_conf = yolo_conf
+        self.gemini_api_key = gemini_api_key
         
-        if "YOLO" in mode:
+        if "Full Eksperimental" in mode:
+            self.mode = "gemini"
+        elif "Gemini Bounding Box" in mode:
+            self.mode = "gemini_bbox"
+        elif "YOLO" in mode:
             self.mode = "yolo"
         elif "Pra-Deteksi" in mode:
             self.mode = "prompt"
@@ -178,7 +184,26 @@ class SAMProcessor:
         return model_path
 
     def load_model(self):
-        """Load SAM/SAM2 and optionally YOLO model into memory."""
+        """Load the required models based on current mode."""
+        if self.mode == "gemini":
+            from core.objects.gemini_processor import GeminiProcessor
+            self._sam = GeminiProcessor(api_key=self.gemini_api_key, log_callback=self._log)
+            if not self._sam.is_ready():
+                raise RuntimeError("Gemini API gagal dimuat. Periksa API Key dan koneksi internet.")
+            self._progress(30, "Gemini API siap")
+            return
+
+        if self.mode == "gemini_bbox":
+            from core.objects.gemini_processor import GeminiProcessor
+            self._gemini = GeminiProcessor(api_key=self.gemini_api_key, log_callback=self._log)
+            if not self._gemini.is_ready():
+                raise RuntimeError("Gemini API gagal dimuat. Periksa API Key dan koneksi internet.")
+            self._progress(5, "Gemini API siap")
+            # Tetap lanjut memuat SAM di bawah karena mode ini butuh SAM juga
+
+        if self.is_cancelled():
+            return
+
         cfg = self.config
         model_type = cfg.get("type")
 
@@ -445,7 +470,8 @@ class SAMProcessor:
             raise RuntimeError("Model belum dimuat. Panggil load_model() terlebih dahulu.")
 
         try:
-            if (self.mode == "prompt" and point_coords) or (self.mode == "yolo" and box_prompts):
+            if ((self.mode == "prompt" and point_coords) or 
+               ((self.mode == "yolo" or self.mode == "gemini_bbox") and box_prompts is not None and len(box_prompts) > 0)):
                 import rasterio
                 
                 # 1. Set the image once to encode it (heavy operation done only once)
@@ -465,7 +491,7 @@ class SAMProcessor:
                 temp_point_path = os.path.join(temp_dir, f"temp_predict_{os.path.basename(tile_path)}")
                 
                 # Loop through each prompt separately to prevent SAM from merging them
-                if self.mode == "yolo" and box_prompts:
+                if (self.mode == "yolo" or self.mode == "gemini_bbox") and box_prompts is not None:
                     # Sort Smallest First! This ensures small buildings claim their pixels
                     # instead of being swallowed by the SAM bleed of larger neighboring buildings.
                     if global_indices is None:
@@ -489,10 +515,10 @@ class SAMProcessor:
                             os.remove(temp_point_path)
                             
                         # Predict single building
-                        if self.mode == "yolo":
+                        if self.mode == "yolo" or self.mode == "gemini_bbox":
                             box_coord, g_idx = item
                             self._sam.predict(
-                                boxes=box_coord,
+                                boxes=box_coord.tolist() if isinstance(box_coord, np.ndarray) else box_coord,
                                 output=temp_point_path
                             )
                         else:
@@ -506,8 +532,8 @@ class SAMProcessor:
                         if os.path.exists(temp_point_path):
                             with rasterio.open(temp_point_path) as temp_src:
                                 point_mask = temp_src.read(1)
-                                if self.mode == "yolo":
-                                    # Crop point_mask strictly to its YOLO bounding box
+                                if self.mode == "yolo" or self.mode == "gemini_bbox":
+                                    # Crop point_mask strictly to its bounding box
                                     # This prevents SAM from bleeding into neighboring buildings!
                                     bx1, by1, bx2, by2 = [int(round(c)) for c in box_coord]
                                     bx1, by1 = max(0, bx1), max(0, by1)
@@ -517,7 +543,7 @@ class SAMProcessor:
                                     point_mask = cropped_mask
 
                                 # Assign a unique ID to this building's pixels to keep them separate in vectorization
-                                building_id = g_idx if self.mode == "yolo" else (idx + 1)
+                                building_id = g_idx if (self.mode == "yolo" or self.mode == "gemini_bbox") else (idx + 1)
                                 # Overwrite where master_mask is empty (0)
                                 master_mask = np.where((point_mask > 0) & (master_mask == 0), building_id, master_mask)
                     except Exception as pe:
@@ -535,23 +561,43 @@ class SAMProcessor:
                     dst.write(master_mask.astype(np.uint16), 1)
                     
             else:
-                try:
-                    self._sam.generate(
-                        source=tile_path,
-                        output=output_mask_path,
-                        foreground=True,
-                        unique=False,
-                    )
-                except TypeError:
-                    self._sam.generate(
-                        source=tile_path,
-                        output=output_mask_path,
-                        unique=False,
-                    )
+                if self.mode in ("yolo", "gemini_bbox"):
+                    # Jika tidak ada kotak pembatas yang ditemukan, cukup buat mask kosong
+                    import rasterio
+                    with rasterio.open(tile_path) as src:
+                        meta = src.meta.copy()
+                        h, w = src.height, src.width
+                    meta.update(dtype="uint16", count=1, nodata=0)
+                    with rasterio.open(output_mask_path, "w", **meta) as dst:
+                        dst.write(np.zeros((h, w), dtype=np.uint16), 1)
+                else:
+                    try:
+                        self._sam.generate(
+                            source=tile_path,
+                            output=output_mask_path,
+                            foreground=True,
+                            unique=False,
+                        )
+                    except TypeError:
+                        self._sam.generate(
+                            source=tile_path,
+                            output=output_mask_path,
+                            unique=False,
+                        )
             return True
         except Exception as e:
             self._log(f"Error pada tile {Path(tile_path).name}: {e}")
             return False
+
+    def _convert_to_global_boxes(self, boxes, x0, y0, transform):
+        """Helper to convert local boxes to global coordinates."""
+        global_boxes = []
+        for box in boxes:
+            x1, y1, x2, y2 = box
+            geo_x1, geo_y1 = transform * (x1, y1)
+            geo_x2, geo_y2 = transform * (x2, y2)
+            global_boxes.append([min(geo_x1,geo_x2), min(geo_y1,geo_y2), max(geo_x1,geo_x2), max(geo_y1,geo_y2)])
+        return global_boxes
 
     def process_raster(
         self,
@@ -584,8 +630,34 @@ class SAMProcessor:
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         tiles_temp_dir = os.path.join(project_root, "temp", "tiles")
 
+        if self.mode == "gemini":
+            self._log("Fase 1: Mengeksekusi Gemini API pada semua tile...")
+            for tile_path, tile_meta, idx, total in tiles_generator(
+                raster_path=raster_path,
+                tile_size=tile_size,
+                overlap=overlap,
+                temp_dir=tiles_temp_dir,
+                enable_filtering=enable_filtering,
+            ):
+                if self.is_cancelled():
+                    self._log("Proses dibatalkan oleh pengguna.")
+                    return results, global_yolo_boxes
+                
+                self._log(f"[{idx+1}/{total}] Fase 1 - Gemini API: {Path(tile_path).stem}")
+                if tile_progress_callback:
+                    tile_progress_callback(idx + 1, total)
+                
+                mask_filename = f"mask_gemini_{Path(tile_path).stem}.tif"
+                mask_path = os.path.join(masks_dir, mask_filename)
+                
+                success = self.process_tile(tile_path, mask_path)
+                if success and os.path.exists(mask_path):
+                    results.append((mask_path, tile_meta))
+                    
+            return results, global_yolo_boxes
+
         # ── FASE 1: Deteksi YOLO / Pra-pemrosesan di Semua Tile ──
-        self._log("Fase 1: Mengeksekusi Pra-pemrosesan (YOLO) pada semua tile...")
+        self._log("Fase 1: Mengeksekusi Pra-pemrosesan (YOLO/Gemini) pada semua tile...")
         all_yolo_detections = []
         tiles_data = []
 
@@ -629,7 +701,12 @@ class SAMProcessor:
                 # Provide progress for phase 1
                 tile_progress_callback(idx + 1, total * 2)
 
-            if self.mode == "yolo" and self._yolo:
+            if self.mode == "gemini_bbox" and hasattr(self, "_gemini"):
+                boxes_np = self._gemini.detect_boxes(tile_path)
+                tile_dict["box_prompts"] = boxes_np
+                self._log(f"   Mendapat {len(boxes_np)} kotak bangunan dari Gemini.")
+
+            elif self.mode == "yolo" and self._yolo:
                 import cv2
                 img = cv2.imread(tile_path)
                 yolo_results = self._yolo(

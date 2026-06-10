@@ -245,7 +245,13 @@ class Sidebar(ctk.CTkScrollableFrame):
         self.mode_var = tk.StringVar(value="Pra-Deteksi (CV + Point Prompts)")
         self.mode_menu = ctk.CTkOptionMenu(
             self,
-            values=["Otomatis (Grid Buta)", "Pra-Deteksi (CV + Point Prompts)", "Pra-Deteksi (YOLO Bounding Box)"],
+            values=[
+                "Otomatis (Grid Buta)", 
+                "Pra-Deteksi (CV + Point Prompts)", 
+                "Pra-Deteksi (YOLO Bounding Box)", 
+                "Eksperimental (Gemini Bounding Box -> SAM)",
+                "Full Eksperimental (Gemini API Poligon)"
+            ],
             variable=self.mode_var,
             font=ctk.CTkFont(size=11),
             height=28,
@@ -255,9 +261,38 @@ class Sidebar(ctk.CTkScrollableFrame):
             dropdown_fg_color="#1E293B",
             dropdown_hover_color="#334155",
             text_color="#E2E8F0",
+            command=self._on_mode_changed,
         )
         self.mode_menu.grid(row=row, column=1, sticky="ew", padx=(4, 12), pady=(4, 0))
         row += 1
+
+        # Gemini API Key Input (Hidden by default, shown only when Gemini mode is selected)
+        self._gemini_key_row = row  # Simpan nomor baris untuk dipakai di _on_mode_changed
+        self.lbl_gemini_key = ctk.CTkLabel(
+            self, text="🔑 Gemini API Key:",
+            font=ctk.CTkFont(size=11), text_color="#FCD34D", anchor="w",
+        )
+        self.gemini_key_var = tk.StringVar()
+        self.entry_gemini_key = ctk.CTkEntry(
+            self, placeholder_text="Masukkan API Key (AI Studio)", width=80, height=28,
+            textvariable=self.gemini_key_var,
+            font=ctk.CTkFont(size=11),
+            fg_color="#1E293B", border_color="#334155", text_color="#E2E8F0", show="*"
+        )
+        # Pasang ke grid terlebih dahulu, lalu langsung sembunyikan
+        self.lbl_gemini_key.grid(row=row, column=0, sticky="w", padx=12, pady=(4, 0))
+        self.entry_gemini_key.grid(row=row, column=1, sticky="ew", padx=(4, 12), pady=(4, 0))
+        self.lbl_gemini_key.grid_remove()
+        self.entry_gemini_key.grid_remove()
+        row += 1
+        # Load saved API key if exists
+        _gemini_key_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".gemini_key")
+        try:
+            with open(_gemini_key_file, "r") as f:
+                self.gemini_key_var.set(f.read().strip())
+        except Exception:
+            pass
+        self.entry_gemini_key.bind("<KeyRelease>", self._save_gemini_key)
 
         # YOLO Model Selector (Only relevant if YOLO mode is selected)
         ctk.CTkLabel(
@@ -457,19 +492,70 @@ class Sidebar(ctk.CTkScrollableFrame):
         ).grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(2, 0))
         row += 1
 
-        self.regularize_var = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(
+        # ── Regularisasi Sudut Bangunan ────────────────────────────────
+        ctk.CTkLabel(
             self,
-            text="Regularisasi Sudut Bangunan",
-            variable=self.regularize_var,
+            text="Regularisasi Sudut Bangunan:",
             font=ctk.CTkFont(size=11),
             text_color="#CBD5E1",
+            anchor="w",
+        ).grid(row=row, column=0, sticky="w", padx=12, pady=(6, 0))
+
+        self.regularize_mode_var = tk.StringVar(value="⚡ Update (V1→V2→V1)")
+        self.regularize_mode_menu = ctk.CTkOptionMenu(
+            self,
+            values=[
+                "⚡ Update (V1→V2→V1)",
+                "🔧 Dasar (V1 Only)",
+                "⏳ V0 (Versi Lama)",
+                "⬜ Nonaktif",
+            ],
+            variable=self.regularize_mode_var,
+            font=ctk.CTkFont(size=11),
+            height=28,
+            fg_color="#1E293B",
+            button_color="#334155",
+            button_hover_color="#475569",
+            dropdown_fg_color="#1E293B",
+            dropdown_hover_color="#334155",
+            text_color="#E2E8F0",
+        )
+        self.regularize_mode_menu.grid(row=row, column=1, sticky="ew", padx=(4, 12), pady=(6, 0))
+        row += 1
+
+        # ── Rectangle Mode ────────────────────────────────
+        # Frame dengan border kuning/amber untuk menonjolkan mode khusus ini
+        rect_mode_frame = ctk.CTkFrame(
+            self, fg_color="#1C1A0F", corner_radius=8,
+            border_width=1, border_color="#78630A",
+        )
+        rect_mode_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=12, pady=(8, 2))
+        rect_mode_frame.grid_columnconfigure(0, weight=1)
+
+        self.rectangle_mode_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            rect_mode_frame,
+            text="⬛  Output Kotak (Rectangle Mode)",
+            variable=self.rectangle_mode_var,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#FCD34D",
             checkmark_color="#0F172A",
-            fg_color="#6366F1",
-            hover_color="#4F46E5",
-            border_color="#334155",
-            height=24,
-        ).grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0))
+            fg_color="#D97706",
+            hover_color="#B45309",
+            border_color="#78630A",
+            height=26,
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 2))
+
+        ctk.CTkLabel(
+            rect_mode_frame,
+            text="Poligon disimplifikasi menjadi satu kotak (MBR).\n"
+                 "Satu bangunan = tepat satu kotak.",
+            font=ctk.CTkFont(size=9),
+            text_color="#92630A",
+            anchor="w",
+            justify="left",
+            wraplength=190,
+        ).grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
         row += 1
 
         # Toleransi Simplifikasi
@@ -486,6 +572,7 @@ class Sidebar(ctk.CTkScrollableFrame):
         self.simplify_var.grid(row=row, column=1, sticky="ew", padx=(4, 12), pady=(4, 0))
         self.simplify_var.insert(0, "0.75")
         row += 1
+
 
         # YOLO Confidence
         ctk.CTkLabel(
@@ -1548,6 +1635,7 @@ class Sidebar(ctk.CTkScrollableFrame):
             "output_dir": self._output_dir.get(),
             "model_name": self.model_var.get(),
             "mode": self.mode_var.get(),
+            "gemini_api_key": self.gemini_key_var.get().strip() if hasattr(self, 'gemini_key_var') else "",
             "yolo_model": self.yolo_var.get(),
             "yolo_conf": yolo_conf,
             "show_yolo_preview": self.show_yolo_preview_var.get(),
@@ -1559,8 +1647,15 @@ class Sidebar(ctk.CTkScrollableFrame):
             "points_per_side": pts_val,
             "enable_shadow_filter": self.shadow_var.get(),
             "enable_vegetation_filter": self.vegetation_var.get(),
-            "enable_regularization": self.regularize_var.get(),
+            "enable_regularization": self.regularize_mode_var.get() != "⬜ Nonaktif",
+            "regularization_mode": (
+                "updated" if "Update" in self.regularize_mode_var.get()
+                else "v1_only" if "Dasar" in self.regularize_mode_var.get()
+                else "v0" if "V0" in self.regularize_mode_var.get()
+                else "off"
+            ),
             "simplify_tolerance": simplify_tol,
+            "rectangle_mode": self.rectangle_mode_var.get(),
             # ── Objek Digitasi ──────────────────────────────────
             "enabled_objects": {
                 "building":   self.obj_building_var.get(),
@@ -1939,3 +2034,23 @@ class Sidebar(ctk.CTkScrollableFrame):
             text=f"Status: {final_msg}",
             text_color="#10B981" if is_success else "#EF4444"
         )
+
+    def _on_mode_changed(self, choice: str):
+        """Show or hide Gemini API key input based on selected mode."""
+        if "Gemini" in choice:
+            self.lbl_gemini_key.grid()
+            self.entry_gemini_key.grid()
+        else:
+            self.lbl_gemini_key.grid_remove()
+            self.entry_gemini_key.grid_remove()
+
+    def _save_gemini_key(self, event=None):
+        """Save the Gemini API key to a local hidden file (path absolut relatif ke root proyek)."""
+        key = self.gemini_key_var.get().strip()
+        if key:
+            try:
+                key_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".gemini_key")
+                with open(key_file, "w") as f:
+                    f.write(key)
+            except Exception:
+                pass

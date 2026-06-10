@@ -695,10 +695,15 @@ class SAMGeoApp(ctk.CTk):
             self.after(0, lambda tg=tiles_geo: self.preview.set_tile_grid(tg))
 
             # ─────────────────────────────────────────────────
-            # STEP 4: Load SAM model
+            # STEP 4: Load model (SAM or Gemini API)
             # ─────────────────────────────────────────────────
-            self._progress(30, f"Memuat model {model_name}...")
-            self._log(f"🤖 Memuat model: {model_name}", "system")
+            current_mode = params.get("mode", "")
+            if "Gemini API" in current_mode:
+                self._progress(30, "Menginisialisasi Gemini API...")
+                self._log("🌐 Menggunakan mode: Full Gemini API Poligon (Eksperimental)", "system")
+            else:
+                self._progress(30, f"Memuat model {model_name}...")
+                self._log(f"🤖 Memuat model: {model_name}", "system")
 
             from core.sam_processor import SAMProcessor
             self._processor = SAMProcessor(
@@ -706,9 +711,10 @@ class SAMGeoApp(ctk.CTk):
                 models_dir=os.path.join(ROOT, "models"),
                 device="auto",
                 points_per_side=params.get("points_per_side", 48),
-                mode=params.get("mode", "Otomatis (Grid Buta)"),
+                mode=current_mode,
                 yolo_model_name=params.get("yolo_model", "yolo12n.pt (YOLO12 Nano - Terbaru)"),
                 yolo_conf=params.get("yolo_conf", 0.15),
+                gemini_api_key=params.get("gemini_api_key", ""),
                 log_callback=self._log,
                 progress_callback=self._progress,
             )
@@ -757,6 +763,17 @@ class SAMGeoApp(ctk.CTk):
             self._log("🔧 Memulai post-processing...", "system")
 
             from core.postprocess import run_postprocess_pipeline
+            rect_mode = params.get("rectangle_mode", False)
+            if rect_mode:
+                self._log("⬛ Mode Kotak aktif: output akan didekomposisi ke rectangle", "system")
+
+            # Resolve regularization mode dari params UI
+            reg_mode_raw = params.get("regularization_mode", "updated")
+            # Jika datang dari sidebar (string dropdown) → sudah diresolve ke "updated"/"v1_only"/"v0"/"off"
+            # Tapi jika datang dari sumber lain (boolean enable_regularization lama) → mapping fallback
+            if reg_mode_raw not in ("updated", "v1_only", "v0", "off"):
+                reg_mode_raw = "updated" if params.get("enable_regularization", True) else "off"
+
             result_gdf = run_postprocess_pipeline(
                 mask_paths_and_metas=mask_results,
                 original_raster_path=raster_path,
@@ -766,8 +783,10 @@ class SAMGeoApp(ctk.CTk):
                 enable_shadow_filter=params["enable_shadow_filter"],
                 enable_vegetation_filter=params.get("enable_vegetation_filter", True),
                 enable_regularization=params["enable_regularization"],
+                regularization_mode=reg_mode_raw,
                 simplify_tolerance=params.get("simplify_tolerance", 0.75),
                 respect_building_id=("YOLO" in params.get("mode", "")),
+                rectangle_mode=rect_mode,
                 log_callback=self._log,
                 progress_callback=self._progress,
             )

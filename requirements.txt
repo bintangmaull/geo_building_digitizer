@@ -29,4 +29,6 @@ segmentation-models-pytorch>=0.3.3
 # WMS / Online Tile Input
 tkintermapview>=1.17       # Peta interaktif untuk WMS panel
 requests>=2.28.0           # HTTP download tile WMS/XYZ
-segmentation-models-pytorch>=0.3.3
+
+# Gemini API Integration
+google-generativeai>=0.8.0

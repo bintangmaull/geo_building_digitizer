@@ -483,6 +483,41 @@ def compute_dominant_angle(geom, simplify_tol=None):
                 best_angle_deg = target_deg
 
         angle = math.radians(best_angle_deg)
+        # Normalize edge-scoring angle to [-pi/4, pi/4]
+        angle = angle % (math.pi / 2)
+        if angle > math.pi / 4:
+            angle -= math.pi / 2
+
+        # ── SEAM-EDGE GUARD via MRR cross-check ──
+        # When a building is cut by a tile boundary, the seam edge (a long straight
+        # line at the exact tile border) can dominate edge scoring and produce a
+        # wrong angle. The MRR (Minimum Rotated Rectangle) sees the overall shape
+        # and is far more robust to such seam artifacts. If edge scoring disagrees
+        # with the MRR orientation by more than 12°, trust the MRR.
+        try:
+            mbr = geom.minimum_rotated_rectangle
+            mbr_coords = list(mbr.exterior.coords)
+            max_len = -1.0
+            mbr_angle = 0.0
+            for i in range(4):
+                dx = mbr_coords[i+1][0] - mbr_coords[i][0]
+                dy = mbr_coords[i+1][1] - mbr_coords[i][1]
+                length = math.hypot(dx, dy)
+                if length > max_len:
+                    max_len = length
+                    mbr_angle = math.atan2(dy, dx)
+            mbr_angle = mbr_angle % (math.pi / 2)
+            if mbr_angle > math.pi / 4:
+                mbr_angle -= math.pi / 2
+
+            angle_diff_deg = abs(math.degrees(angle - mbr_angle))
+            if angle_diff_deg > 45:
+                angle_diff_deg = 90 - angle_diff_deg
+            if angle_diff_deg > 12.0:
+                # Edge scoring likely corrupted by seam → use robust MRR angle
+                angle = mbr_angle
+        except Exception:
+            pass
 
     except Exception:
         # Fallback to MBR longest edge
@@ -501,10 +536,10 @@ def compute_dominant_angle(geom, simplify_tol=None):
         except Exception:
             return 0.0
 
-    # Normalize angle to -45..45 degrees
-    angle = angle % (math.pi / 2)
-    if angle > math.pi / 4:
-        angle -= math.pi / 2
+        # Normalize angle to -45..45 degrees
+        angle = angle % (math.pi / 2)
+        if angle > math.pi / 4:
+            angle -= math.pi / 2
 
     return angle
 
@@ -528,6 +563,26 @@ def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr, forc
         angle = forced_angle
     else:
         angle = 0.0
+        mbr_angle = 0.0
+        
+        # First, compute MRR-based angle as reference (robust to seam artifacts)
+        try:
+            mbr_coords_ref = list(mbr.exterior.coords)
+            max_len_ref = -1.0
+            for i in range(4):
+                dx = mbr_coords_ref[i+1][0] - mbr_coords_ref[i][0]
+                dy = mbr_coords_ref[i+1][1] - mbr_coords_ref[i][1]
+                length = math.hypot(dx, dy)
+                if length > max_len_ref:
+                    max_len_ref = length
+                    mbr_angle = math.atan2(dy, dx)
+            mbr_angle = mbr_angle % (math.pi / 2)
+            if mbr_angle > math.pi / 4:
+                mbr_angle -= math.pi / 2
+        except Exception:
+            mbr_angle = 0.0
+        
+        # Then, try Edge Scoring
         try:
             angle_simplify_tol = 0.8 if actual_simplify_tol > 0.1 else (0.8 / 111320)
             pre_simplified = geom.simplify(angle_simplify_tol, preserve_topology=True)
@@ -567,20 +622,27 @@ def _rta_orthogonalize(geom, angle_tolerance_deg, actual_simplify_tol, mbr, forc
                     max_score = score
                     best_angle_deg = target_deg
 
-            angle = math.radians(best_angle_deg)
+            edge_angle = math.radians(best_angle_deg)
+            # Normalize edge_angle
+            edge_angle = edge_angle % (math.pi / 2)
+            if edge_angle > math.pi / 4:
+                edge_angle -= math.pi / 2
+            
+            # Cross-check: if edge scoring disagrees with MRR by more than 15 degrees,
+            # the edge scoring is likely corrupted by tile-boundary seam edges.
+            # In that case, trust MRR (which sees the overall shape).
+            angle_diff_deg = abs(math.degrees(edge_angle - mbr_angle))
+            if angle_diff_deg > 45:
+                angle_diff_deg = 90 - angle_diff_deg
+            
+            if angle_diff_deg > 15.0:
+                angle = mbr_angle
+            else:
+                angle = edge_angle
                 
         except Exception as e:
-            print(f"DEBUG RTA: Exception in angle calc: {e}")
-            # Fallback to MBR if anything fails
-            mbr_coords = list(mbr.exterior.coords)
-            max_len = -1.0
-            for i in range(4):
-                dx = mbr_coords[i+1][0] - mbr_coords[i][0]
-                dy = mbr_coords[i+1][1] - mbr_coords[i][1]
-                length = math.hypot(dx, dy)
-                if length > max_len:
-                    max_len = length
-                    angle = math.atan2(dy, dx)
+            # Fallback to MRR angle
+            angle = mbr_angle
                     
         # Normalize angle to -45..45 degrees
         angle = angle % (math.pi / 2)
@@ -1372,14 +1434,24 @@ def run_postprocess_pipeline(
     enable_vegetation_filter: bool = True,
     greenness_threshold: float = 15.0,
     enable_regularization: bool = True,
+    regularization_mode: str = "updated",
     angle_tolerance: float = 15.0,
     simplify_tolerance: float = 0.75,
     respect_building_id: bool = False,
+    rectangle_mode: bool = False,
     log_callback: Optional[Callable[[str], None]] = None,
     progress_callback: Optional[Callable[[int, str], None]] = None,
 ) -> "geopandas.GeoDataFrame":
     """
     Full post-processing pipeline from mask tiles to final building polygons.
+
+    Args:
+        regularization_mode: Pilih pipeline regularisasi:
+            "updated" (default) — Same as v1_only in this version
+            "v1_only"           — Single-pass orthogonalization
+            "v0"                — Same as v1_only (legacy alias)
+            "off"               — Nonaktif (juga diatur oleh enable_regularization=False)
+        rectangle_mode: Jika True, output polygon disimplifikasi ke MBR (kotak).
     """
     log = log_callback or (lambda x: None)
     progress = progress_callback or (lambda pct, msg: None)
@@ -1430,7 +1502,8 @@ def run_postprocess_pipeline(
     gdf = merge_overlapping_fragments(gdf, threshold=0.12, respect_building_id=respect_building_id, log_callback=log)
 
     # 5. Regularization
-    if enable_regularization:
+    effective_reg_mode = regularization_mode if enable_regularization else "off"
+    if effective_reg_mode != "off":
         progress(91, "Regularisasi sudut poligon bangunan (dengan deteksi pohon)...")
         gdf = regularize_polygons(
             gdf, 
@@ -1442,6 +1515,7 @@ def run_postprocess_pipeline(
             log_callback=log
         )
     else:
+        log("ℹ️ Regularisasi dinonaktifkan")
         # Clean up internal column even if regularization is skipped
         if "_precomputed_angle" in gdf.columns:
             gdf = gdf.drop(columns=["_precomputed_angle"])
@@ -1450,7 +1524,24 @@ def run_postprocess_pipeline(
     progress(93, "Menghilangkan poligon tumpang tindih (avoid overlap)...")
     gdf = resolve_overlaps(gdf, log_callback=log)
 
+    # 7. Rectangle Mode: simplify polygons to their MBR
+    if rectangle_mode:
+        progress(95, "Mode Kotak: menyederhanakan poligon ke MBR...")
+        from shapely.geometry import Polygon
+        new_geoms = []
+        for geom in gdf.geometry:
+            try:
+                mbr = geom.minimum_rotated_rectangle
+                if mbr and not mbr.is_empty:
+                    new_geoms.append(mbr)
+                else:
+                    new_geoms.append(geom)
+            except Exception:
+                new_geoms.append(geom)
+        gdf["geometry"] = new_geoms
+        log(f"Mode Kotak: {len(gdf)} poligon disederhanakan ke MBR")
+
     log(f"=== POST-PROCESSING SELESAI: {len(gdf)} bangunan terdeteksi ===")
-    progress(95, f"Selesai: {len(gdf)} bangunan terdeteksi")
+    progress(97, f"Selesai: {len(gdf)} bangunan terdeteksi")
 
     return gdf
